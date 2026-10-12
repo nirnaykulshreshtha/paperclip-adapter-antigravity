@@ -8,6 +8,15 @@ import { stageAssignedSkills } from '../lib/skills.js';
 import { runAgy } from '../lib/process.js';
 import { errorText, looksLikePermissionDenial, sessionIdFrom, usageOf, isObj } from '../lib/result.js';
 import { estimateCostUsd } from '../lib/pricing.js';
+import { detectActiveAccount } from '../lib/account.js';
+import {
+  loadAccountPool,
+  syncKeychainToPool,
+  getNextReadyAccount,
+  activateAccount,
+  markAccountQuotaExhausted,
+  parseQuotaResetDuration,
+} from '../lib/account-pool.js';
 
 const safeText=(v,max=5000)=>typeof v==='string'?v.slice(0,max):'';
 const maybeStr=(v)=>typeof v==='string'?v:'';
@@ -319,20 +328,85 @@ export async function executeWithHelpers(ctx, helpers) {
     if (oldId && typeof previous?.cwd === 'string' && path.isAbsolute(previous.cwd)) {
       previousCwd = await realpath(previous.cwd).catch(() => null);
     }
-    const forceFresh = Boolean(ctx.context?.forceFreshSession);
+    let pool = null;
+    const poolPath = cfg.accountPoolFile || undefined;
+    if (cfg.enableAccountRotation) {
+      try {
+        pool = await loadAccountPool(poolPath);
+        pool = await syncKeychainToPool(pool);
+        const now = Date.now();
+        const activeEntry = pool.accounts.find(a => a.email.toLowerCase() === (pool.activeAccount || '').toLowerCase());
+        if (activeEntry && activeEntry.status === 'quota_exhausted' && activeEntry.quotaResetAt && now < activeEntry.quotaResetAt) {
+          const readyAcc = getNextReadyAccount(pool, activeEntry.email);
+          if (readyAcc) {
+            const activated = await activateAccount(readyAcc.email, pool);
+            if (activated) {
+              await ctx.onEvent?.({
+                eventType: 'account.auto_switched',
+                stream: 'system',
+                level: 'warn',
+                message: `Active account '${activeEntry.email}' is currently on quota cooldown (resets in ${Math.round((activeEntry.quotaResetAt - now) / 60000)}m). Auto-switched to ready account '${readyAcc.email}'.`,
+                payload: {
+                  previousAccount: activeEntry.email,
+                  currentAccount: readyAcc.email,
+                  quotaResetAt: activeEntry.quotaResetAt,
+                },
+              });
+            }
+          }
+        }
+      } catch {}
+    }
+
+    const activeAccount = await detectActiveAccount().catch(() => null);
+    let currentAccountEmail = activeAccount?.email || pool?.activeAccount || null;
+    const previousAccount = previous?.account || null;
+    const accountChanged = Boolean(previousAccount && currentAccountEmail && previousAccount !== currentAccountEmail);
+    if (accountChanged) {
+      await ctx.onEvent?.({
+        eventType: 'account.switched',
+        stream: 'system',
+        level: 'info',
+        message: `Active account switched from '${previousAccount}' to '${currentAccountEmail}'. Starting fresh conversation session for new account.`,
+        payload: {
+          previousAccount,
+          currentAccount: currentAccountEmail,
+          authMethod: activeAccount?.authMethod || 'consumer',
+        },
+      });
+    }
+    if (currentAccountEmail) {
+      await ctx.onEvent?.({
+        eventType: 'account.active',
+        stream: 'system',
+        level: 'info',
+        message: `Active Antigravity account: ${currentAccountEmail}`,
+        payload: {
+          email: currentAccountEmail,
+          authMethod: activeAccount?.authMethod || 'consumer',
+          expired: activeAccount?.expired || false,
+        },
+      });
+    }
+    const forceFresh = Boolean(ctx.context?.forceFreshSession || accountChanged);
     const canResume = Boolean(!forceFresh && oldId && previousCwd === cwd &&
       (!previous.taskKey || previous.taskKey === taskKey) &&
-      (!previous.workspaceId || previous.workspaceId === workspaceId));
-    if(oldId && !canResume && !forceFresh) {
+      (!previous.workspaceId || previous.workspaceId === workspaceId) &&
+      (!previous.account || !currentAccountEmail || previous.account === currentAccountEmail));
+    if (oldId && !canResume && !forceFresh) {
       throw new Error('Stored conversation belongs to another workspace or task; reset the Paperclip session before retrying');
     }
-    const args=['--input-format','stream-json','--output-format','stream-json','--sandbox',
-      `--mode=${cfg.executionMode==='planning'?'plan':'default'}`, '--print-timeout',`${cfg.timeoutSec}s`];
-    args.push('--model',cfg.model);
-    if (stagedSkills.root) args.push('--add-dir', stagedSkills.root);
-    if(cfg.effort)args.push('--effort',cfg.effort);
-    if(cfg.cliAgent)args.push('--agent',cfg.cliAgent);
-    if(canResume)args.push('--conversation',oldId);
+    const buildArgs = (modelToUse, resumeConvId) => {
+      const a = ['--input-format', 'stream-json', '--output-format', 'stream-json', '--sandbox',
+        `--mode=${cfg.executionMode === 'planning' ? 'plan' : 'default'}`, '--print-timeout', `${cfg.timeoutSec}s`];
+      a.push('--model', modelToUse);
+      if (stagedSkills.root) a.push('--add-dir', stagedSkills.root);
+      if (cfg.effort) a.push('--effort', cfg.effort);
+      if (cfg.cliAgent) a.push('--agent', cfg.cliAgent);
+      if (resumeConvId) a.push('--conversation', resumeConvId);
+      return a;
+    };
+    const args = buildArgs(cfg.model, canResume ? oldId : null);
     // Strictly reserved env: reject inherited agent identity and runtime API credentials.
     const inherited=Object.fromEntries(Object.entries(process.env).filter(([key,value]) =>
       typeof value==='string' && (/^(PATH|HOME|USER|LOGNAME|SHELL|TMPDIR|LANG|LC_[A-Z_]+|XDG_[A-Z_]+|SSL_CERT_FILE|NODE_EXTRA_CA_CERTS|HTTPS_PROXY|HTTP_PROXY|NO_PROXY)$/i.test(key))));
@@ -375,11 +449,95 @@ export async function executeWithHelpers(ctx, helpers) {
       await log('stdout', `${JSON.stringify(payload)}\n`);
     };
 
+    const classifyError = (p) => {
+      const combined = `${p?.stderr || ''}\n${p?.reason || ''}\n${p?.final?.error || ''}`;
+      const isAuth = /(?:not\s+logged\s+into|not\s+logged\s+in|login\s+required|run\s+`?agy\s+auth(?:\s+login)?`?\s+first|please\s+authenticate|token\s+source|unauthenticated|unauthorized|invalid\s+credentials|api[_ ]?key\s+(?:required|missing|invalid)|auth(?:entication)?\s+required)/i.test(combined);
+      const isQuota = !isAuth && (/(?:RESOURCE_EXHAUSTED|quota|rate[-\s]?limit|token\s*limit|too\s+many\s+requests|\b429\b|billing\s+details|exceeded.*quota|out\s+of\s+quota|out\s+of\s+tokens)/i.test(combined) ||
+                      (p?.code === 3 && /quota|rate\s*limit|limit|exhaust/i.test(combined)));
+      const isSessionLost = /conversation.*(?:not\s+found|invalid|expired)|unknown\s+session|cannot\s+resume|failed\s+to\s+resume/i.test(combined);
+      const isTurnLimit = p?.code === 53 || /(?:turn_limit|max_turns)/i.test(combined);
+
+      if (isTurnLimit) {
+        return {
+          errorCode: 'agent_turn_limit_reached',
+          errorFamily: 'execution',
+          message: 'Antigravity reached maximum conversation turn limit. Task should be broken down into smaller sub-tasks.',
+          clearSession: false,
+        };
+      }
+      if (isQuota) {
+        return {
+          errorCode: 'provider_quota',
+          errorFamily: 'provider_quota',
+          message: 'Antigravity token limit / quota reached. Verify Google account quota or switch accounts.',
+          clearSession: true,
+        };
+      }
+      if (isAuth) {
+        return {
+          errorCode: 'provider_auth_error',
+          errorFamily: 'auth',
+          message: 'Antigravity authentication required or account changed. Verify Google account login via agy.',
+          clearSession: true,
+        };
+      }
+      if (isSessionLost) {
+        return {
+          errorCode: 'session_lost',
+          errorFamily: 'session',
+          message: 'Antigravity conversation session invalid or expired; resetting session.',
+          clearSession: true,
+        };
+      }
+      if (p?.code === 3) {
+        return {
+          errorCode: 'provider_auth_error',
+          errorFamily: 'auth',
+          message: 'Antigravity exited 3; verify Google authentication, account selection and token quota locally',
+          clearSession: true,
+        };
+      }
+      return null;
+    };
+
     let lastAssistantSnippet = '';
     let toolStepCounter = 0;
     const activeToolCalls = new Map();
 
-    const proc=await runAgy({command:cfg.command,args,cwd,env,prompt,
+    let resumeConvId = canResume ? oldId : null;
+    let proc = null;
+    const attemptedAccounts = new Set();
+    if (currentAccountEmail) attemptedAccounts.add(currentAccountEmail.toLowerCase());
+
+    const maxRotations = cfg.enableAccountRotation && pool && pool.accounts.length > 1
+      ? pool.accounts.length
+      : 1;
+    let rotationAttempts = 0;
+
+    while (true) {
+      const runArgs = buildArgs(cfg.model, resumeConvId);
+      if (rotationAttempts > 0) {
+        await ctx.onMeta?.({
+          adapterType: 'antigravity_local',
+          command: cfg.command,
+          cwd,
+          commandArgs: runArgs,
+          workspaceId,
+          commandNotes: [
+            'Prompt sent via stdin; secrets omitted',
+            ...(currentAccountEmail ? [`Rotated to account: ${currentAccountEmail}`] : []),
+            'Paperclip-assigned issue worktree verified',
+            'Sandbox enabled; permissions governed by agy user settings',
+          ],
+        });
+      }
+
+      proc = await runAgy({
+        command: cfg.command,
+        args: runArgs,
+        cwd,
+        env,
+        prompt,
       timeoutMs:cfg.timeoutSec*1000,graceMs:cfg.graceSec*1000,maxBytes:cfg.maxOutputBytes,
       signal:ctx.signal,
       onSpawn:async(meta)=>{
@@ -700,59 +858,59 @@ export async function executeWithHelpers(ctx, helpers) {
           }
         }
       },
-      onStderr:async(text)=>{if(looksLikePermissionDenial(text))permissionFailure=true;},
+      onStderr: async (text) => { if (looksLikePermissionDenial(text)) permissionFailure = true; },
     });
-    const classifyError = (p) => {
-      const combined = `${p.stderr || ''}\n${p.reason || ''}\n${p.final?.error || ''}`;
-      const isAuth = /(?:not\s+logged\s+into|not\s+logged\s+in|login\s+required|run\s+`?agy\s+auth(?:\s+login)?`?\s+first|please\s+authenticate|token\s+source|unauthenticated|unauthorized|invalid\s+credentials|api[_ ]?key\s+(?:required|missing|invalid)|auth(?:entication)?\s+required)/i.test(combined);
-      const isQuota = !isAuth && (/(?:RESOURCE_EXHAUSTED|quota|rate[-\s]?limit|token\s*limit|too\s+many\s+requests|\b429\b|billing\s+details|exceeded.*quota|out\s+of\s+quota|out\s+of\s+tokens)/i.test(combined) ||
-                      (p.code === 3 && /quota|rate\s*limit|limit|exhaust/i.test(combined)));
-      const isSessionLost = /conversation.*(?:not\s+found|invalid|expired)|unknown\s+session|cannot\s+resume|failed\s+to\s+resume/i.test(combined);
-      const isTurnLimit = p.code === 53 || /(?:turn_limit|max_turns)/i.test(combined);
 
-      if (isTurnLimit) {
-        return {
-          errorCode: 'agent_turn_limit_reached',
-          errorFamily: 'execution',
-          message: 'Antigravity reached maximum conversation turn limit. Task should be broken down into smaller sub-tasks.',
-          clearSession: false,
-        };
-      }
-      if (isQuota) {
-        return {
-          errorCode: 'provider_quota',
-          errorFamily: 'provider_quota',
-          message: 'Antigravity token limit / quota reached. Verify Google account quota or switch accounts.',
-          clearSession: true,
-        };
-      }
-      if (isAuth) {
-        return {
-          errorCode: 'provider_auth_error',
-          errorFamily: 'auth',
-          message: 'Antigravity authentication required or account changed. Verify Google account login via agy.',
-          clearSession: true,
-        };
-      }
-      if (isSessionLost) {
-        return {
-          errorCode: 'session_lost',
-          errorFamily: 'session',
-          message: 'Antigravity conversation session invalid or expired; resetting session.',
-          clearSession: true,
-        };
-      }
-      if (p.code === 3) {
-        return {
-          errorCode: 'provider_auth_error',
-          errorFamily: 'auth',
-          message: 'Antigravity exited 3; verify Google authentication, account selection and token quota locally',
-          clearSession: true,
-        };
-      }
-      return null;
-    };
     const classification = classifyError(proc);
+    if (classification?.errorCode === 'provider_quota' && cfg.enableAccountRotation && pool && rotationAttempts < maxRotations) {
+      const combined = `${proc.stderr || ''}\n${proc.reason || ''}\n${proc.final?.error || ''}`;
+      const cooldownMs = parseQuotaResetDuration(combined);
+      if (currentAccountEmail) {
+        await markAccountQuotaExhausted(currentAccountEmail, pool, cooldownMs, combined.slice(0, 500));
+      }
+
+      const nextReady = getNextReadyAccount(pool, currentAccountEmail);
+      if (nextReady && !attemptedAccounts.has(nextReady.email.toLowerCase())) {
+        rotationAttempts++;
+        attemptedAccounts.add(nextReady.email.toLowerCase());
+
+        await ctx.onEvent?.({
+          eventType: 'account.auto_switched',
+          stream: 'system',
+          level: 'warn',
+          message: `Account '${currentAccountEmail}' exhausted quota (${Math.round(cooldownMs / 60000)}m cooldown). Auto-rotating to ready account '${nextReady.email}' and retrying turn with model ${cfg.model}.`,
+          payload: {
+            previousAccount: currentAccountEmail,
+            currentAccount: nextReady.email,
+            cooldownMs,
+            model: cfg.model,
+            rotationAttempt: rotationAttempts,
+          },
+        });
+
+        await ctx.onRuntimeProgress?.({
+          phase: 'run_activity',
+          message: `Switched account to ${nextReady.email}; retrying turn with ${cfg.model}...`,
+          currentToolName: null,
+          lastAssistantSnippet: null,
+          lastEventAt: new Date(),
+        });
+
+        const activated = await activateAccount(nextReady.email, pool);
+        if (activated) {
+          currentAccountEmail = nextReady.email;
+          resumeConvId = null;
+          activeToolCalls.clear();
+          lastAssistantSnippet = '';
+          permissionFailure = false;
+          continue;
+        }
+      }
+    }
+
+    break;
+  }
+  const classification = classifyError(proc);
     const fail=(message,clearSession=false,extra={})=>{
       ctx.onRuntimeProgress?.({
         phase: 'finalize',
@@ -795,7 +953,12 @@ export async function executeWithHelpers(ctx, helpers) {
     if(permissionFailure || looksLikePermissionDenial(proc.stderr))return fail('Antigravity denied a tool permission; run is not complete');
     if(proc.code!==0) {
       if (classification) {
-        return fail(classification.message, classification.clearSession, {
+        let msg = classification.message;
+        if (classification.errorCode === 'provider_quota' && pool?.accounts?.length > 1) {
+          const breakdown = pool.accounts.map(a => `${a.email}: ${a.status === 'quota_exhausted' ? `quota exhausted (resets in ${a.quotaResetAt ? Math.max(0, Math.round((a.quotaResetAt - Date.now()) / 60000)) + 'm' : 'cooldown'})` : a.status}`).join('; ');
+          msg = `All available Antigravity accounts exhausted quota (${breakdown}). Retry scheduled or wait for cooldown.`;
+        }
+        return fail(msg, classification.clearSession, {
           errorCode: classification.errorCode,
           errorFamily: classification.errorFamily,
         });
@@ -808,7 +971,12 @@ export async function executeWithHelpers(ctx, helpers) {
     if(!['SUCCESS','ERROR','CANCELED','INTERRUPTED','INVALID','WAITING','RUNNING'].includes(proc.final.status) || typeof proc.final.response!=='string')return fail('Invalid Antigravity final result payload');
     if(proc.final.status!=='SUCCESS'){
       if (classification) {
-        return fail(classification.message, classification.clearSession, {
+        let msg = classification.message;
+        if (classification.errorCode === 'provider_quota' && pool?.accounts?.length > 1) {
+          const breakdown = pool.accounts.map(a => `${a.email}: ${a.status === 'quota_exhausted' ? `quota exhausted (resets in ${a.quotaResetAt ? Math.max(0, Math.round((a.quotaResetAt - Date.now()) / 60000)) + 'm' : 'cooldown'})` : a.status}`).join('; ');
+          msg = `All available Antigravity accounts exhausted quota (${breakdown}). Retry scheduled or wait for cooldown.`;
+        }
+        return fail(msg, classification.clearSession, {
           errorCode: classification.errorCode,
           errorFamily: classification.errorFamily,
         });
@@ -842,7 +1010,7 @@ export async function executeWithHelpers(ctx, helpers) {
     }
 
     const id=typeof proc.final.conversation_id==='string' && /^[\w-]{5,200}$/.test(proc.final.conversation_id)?proc.final.conversation_id:null;
-    const next=id?{conversationId:id,cwd,taskKey,workspaceId,usageScope:'cumulative'}:null;
+    const next=id?{conversationId:id,cwd,taskKey,workspaceId,usageScope:'cumulative',account:currentAccountEmail}:null;
     // Calculate estimated USD billing from real usage token counts and model rates so Paperclip tracks ledger costs.
     const usageObj = usageOf(proc.final);
     const estimatedCost = estimateCostUsd(cfg.model, usageObj.usage);
@@ -905,6 +1073,7 @@ export async function executeWithHelpers(ctx, helpers) {
         conversationContinuation: 'continue_conversation_v1',
         response: safeText(proc.final.response, 20000),
         conversation_id: id,
+        account: currentAccountEmail,
         worktree: {
           branch: workspace.branch,
           dirtyCount,

@@ -3,7 +3,20 @@ import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
+process.env.NODE_ENV = 'test';
 const exec=promisify(execFile);
+
+export function makeMockToken(email) {
+  const claims = Buffer.from(JSON.stringify({ email, name: email.split('@')[0] })).toString('base64url');
+  const idToken = `header.${claims}.sig`;
+  const json = JSON.stringify({
+    token: { access_token: 'tok', refresh_token: 'ref', expiry: '2099-01-01T00:00:00Z' },
+    id_token: idToken,
+    auth_method: 'consumer',
+  });
+  return `go-keyring-base64:${Buffer.from(json).toString('base64')}`;
+}
+
 export async function fixture(t) {
   const root=await mkdtemp(path.join(tmpdir(),'agy-adapter-test-'));
   t.after(async()=>rm(root,{force:true,recursive:true}));
@@ -17,6 +30,8 @@ export async function fixture(t) {
   await exec('git',['-C',primary,'commit','-m','init','-q']);
   await exec('git',['-C',primary,'worktree','add','-q','-b','pilot/test',secondary]);
   await writeFile(path.join(secondary,'.paperclip-antigravity-allow'),'ALLOW_PAPERCLIP_ANTIGRAVITY_LOCAL\n');
+  const mockPoolFile = path.join(root, 'antigravity-accounts.json');
+  await writeFile(mockPoolFile, JSON.stringify({ version: 1, activeAccount: null, accounts: [] }));
   const exe=path.join(root,'agy-stub');
   await writeFile(exe,`#!/usr/bin/env node
 let chunks='';
@@ -30,6 +45,17 @@ process.stdin.on('end',()=>{
  if(scenario==='MALFORMED'){console.log('{not JSON}');process.exit(0);}
  if(scenario==='NO_RESULT'){console.log(JSON.stringify({event:'init',conversation_id:'abcde-123'}));process.exit(0);}
  if(scenario==='QUOTA'){console.error('RESOURCE_EXHAUSTED: quota exceeded 429');process.exit(3);}
+ if(scenario==='QUOTA_ONCE'){
+   const fs = require('fs');
+   const path = require('path');
+   const os = require('os');
+   const flag = path.join(os.tmpdir(), '.quota_once_hit_' + process.ppid);
+   if(!fs.existsSync(flag)){
+     fs.writeFileSync(flag, 'hit');
+     console.error('RESOURCE_EXHAUSTED: quota exceeded 429. Resets in 30m.');
+     process.exit(3);
+   }
+ }
  if(scenario==='AUTH_FAIL'){console.error('error getting token source: You are not logged into Antigravity.');process.exit(3);}
  if(scenario==='TURN_LIMIT'){console.error('turn_limit: max turns reached');process.exit(53);}
  if(scenario==='UNCLASSIFIED'){console.error('fatal: custom execution error occurred');process.exit(1);}
@@ -45,8 +71,8 @@ process.stdin.on('end',()=>{
 });
 `);
   await chmod(exe,0o755);
-  const config={command:exe,cwd:secondary,allowedWorkspaceRoot:secondary,executionMode:'planning',model:'gemini-3.8-flash-low',timeoutSec:30};
-  return {root,primary,secondary,exe,config};
+  const config={command:exe,cwd:secondary,allowedWorkspaceRoot:secondary,executionMode:'planning',model:'gemini-3.8-flash-low',timeoutSec:30,accountPoolFile:mockPoolFile};
+  return {root,primary,secondary,exe,config,mockPoolFile};
 }
 export function fakeContext(config, taskTitle='SCENARIO_OK') {
   const logs=[]; const spawned=[];

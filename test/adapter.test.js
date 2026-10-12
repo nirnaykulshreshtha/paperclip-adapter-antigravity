@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {writeFile, realpath, symlink} from 'node:fs/promises';
 import path from 'node:path';
-import {fixture,fakeContext,helpers} from './fixtures.js';
+import {fixture,fakeContext,helpers,makeMockToken} from './fixtures.js';
 import {executeWithHelpers, formatToolProgress} from '../src/server/execute.js';
 import {normalizeConfig} from '../src/lib/config.js';
 import {sessionCodec} from '../src/lib/result.js';
@@ -226,4 +226,101 @@ test('estimateCostUsd calculates accurate token pricing across model tiers', () 
   assert.equal(estimateCostUsd('gemini-3.8-flash-high', { inputTokens: 0, outputTokens: 0 }), 0);
   assert.equal(estimateCostUsd('gemini-3.8-flash-high', null), null);
   assert.equal(estimateCostUsd('gemini-3.8-flash-high', { input_tokens: 1_000_000 }), 0.10);
+});
+
+test('auto-rotates to next ready account on quota exhaustion (429) and retries turn with original model', async (t) => {
+  const f = await fixture(t);
+  const acc1 = 'account1@example.com';
+  const acc2 = 'account2@example.com';
+  const token1 = makeMockToken(acc1);
+  const token2 = makeMockToken(acc2);
+
+  const pool = {
+    version: 1,
+    activeAccount: acc1,
+    accounts: [
+      { email: acc1, tokenPayload: token1, status: 'ready', expiry: '2099-01-01T00:00:00Z', quotaResetAt: null, lastUsedAt: null },
+      { email: acc2, tokenPayload: token2, status: 'ready', expiry: '2099-01-01T00:00:00Z', quotaResetAt: null, lastUsedAt: null },
+    ],
+  };
+  await writeFile(f.mockPoolFile, JSON.stringify(pool, null, 2));
+  process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD = token1;
+
+  const events = [];
+  const { ctx, spawned } = fakeContext(f.config, 'SCENARIO_QUOTA_ONCE');
+  ctx.onEvent = async (e) => events.push(e);
+
+  const res = await executeWithHelpers(ctx, helpers);
+  assert.equal(res.exitCode, 0, JSON.stringify(res));
+  assert.equal(res.sessionParams.account, acc2);
+  assert.equal(res.model, 'gemini-3.8-flash-low');
+  assert.equal(spawned.length, 2);
+
+  const autoSwitchEvt = events.find(e => e.eventType === 'account.auto_switched');
+  assert.ok(autoSwitchEvt, 'account.auto_switched event must be emitted');
+  assert.equal(autoSwitchEvt.payload.previousAccount, acc1);
+  assert.equal(autoSwitchEvt.payload.currentAccount, acc2);
+  assert.equal(autoSwitchEvt.payload.model, 'gemini-3.8-flash-low');
+  assert.equal(process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD, token2);
+});
+
+test('pre-turn auto-switches to ready account if active account is on quota cooldown', async (t) => {
+  const f = await fixture(t);
+  const acc1 = 'account1@example.com';
+  const acc2 = 'account2@example.com';
+  const token1 = makeMockToken(acc1);
+  const token2 = makeMockToken(acc2);
+
+  const pool = {
+    version: 1,
+    activeAccount: acc1,
+    accounts: [
+      { email: acc1, tokenPayload: token1, status: 'quota_exhausted', expiry: '2099-01-01T00:00:00Z', quotaResetAt: Date.now() + 1800000, lastUsedAt: null },
+      { email: acc2, tokenPayload: token2, status: 'ready', expiry: '2099-01-01T00:00:00Z', quotaResetAt: null, lastUsedAt: null },
+    ],
+  };
+  await writeFile(f.mockPoolFile, JSON.stringify(pool, null, 2));
+  process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD = token1;
+
+  const events = [];
+  const { ctx, spawned } = fakeContext(f.config, 'SCENARIO_OK');
+  ctx.onEvent = async (e) => events.push(e);
+
+  const res = await executeWithHelpers(ctx, helpers);
+  assert.equal(res.exitCode, 0, JSON.stringify(res));
+  assert.equal(res.sessionParams.account, acc2);
+  assert.equal(spawned.length, 1);
+
+  const autoSwitchEvt = events.find(e => e.eventType === 'account.auto_switched');
+  assert.ok(autoSwitchEvt, 'account.auto_switched event must be emitted before dispatch');
+  assert.equal(autoSwitchEvt.payload.previousAccount, acc1);
+  assert.equal(autoSwitchEvt.payload.currentAccount, acc2);
+  assert.equal(process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD, token2);
+});
+
+test('fails with provider_quota when all accounts in pool are exhausted', async (t) => {
+  const f = await fixture(t);
+  const acc1 = 'account1@example.com';
+  const acc2 = 'account2@example.com';
+  const token1 = makeMockToken(acc1);
+  const token2 = makeMockToken(acc2);
+
+  const pool = {
+    version: 1,
+    activeAccount: acc1,
+    accounts: [
+      { email: acc1, tokenPayload: token1, status: 'ready', expiry: '2099-01-01T00:00:00Z', quotaResetAt: null, lastUsedAt: null },
+      { email: acc2, tokenPayload: token2, status: 'ready', expiry: '2099-01-01T00:00:00Z', quotaResetAt: null, lastUsedAt: null },
+    ],
+  };
+  await writeFile(f.mockPoolFile, JSON.stringify(pool, null, 2));
+  process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD = token1;
+
+  const { ctx, spawned } = fakeContext(f.config, 'SCENARIO_QUOTA');
+  const res = await executeWithHelpers(ctx, helpers);
+
+  assert.notEqual(res.exitCode, 0);
+  assert.equal(res.errorCode, 'provider_quota');
+  assert.match(res.errorMessage, /all available antigravity accounts exhausted quota/i);
+  assert.equal(spawned.length, 2);
 });

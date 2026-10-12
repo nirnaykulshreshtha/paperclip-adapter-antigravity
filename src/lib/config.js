@@ -51,6 +51,10 @@ export function normalizeConfig(raw = {}) {
   if (approvedProjectIds.length && workspaceMode !== 'paperclip') {
     throw new Error('Project implementation authorization requires Paperclip isolated workspaces');
   }
+  const accountPoolFile = text(raw.accountPoolFile);
+  if (accountPoolFile && !path.isAbsolute(accountPoolFile)) {
+    throw new Error('accountPoolFile must be an absolute path');
+  }
   return {
     approvedProjectIds: [...new Set(approvedProjectIds)],
     allowUnattendedRuntime: raw.allowUnattendedRuntime === true,
@@ -58,6 +62,8 @@ export function normalizeConfig(raw = {}) {
     command, cwd, allowedWorkspaceRoot: root, repositoryRoot, workspaceMode, executionMode: mode,
     enableImplementation: raw.enableImplementation === true,
     sandbox: true, model, effort, cliAgent,
+    enableAccountRotation: raw.enableAccountRotation !== false,
+    accountPoolFile: accountPoolFile || null,
     timeoutSec: int(raw.timeoutSec, 300, 30, 3600),
     probeAuthentication: raw.probeAuthentication !== false,
     probeTimeoutSec: int(raw.probeTimeoutSec, 35, 10, 120),
@@ -85,6 +91,8 @@ export const configSchema = {
     { key: 'effort', label: 'Reasoning effort', type: 'select', options: [{label:'CLI default',value:''},{label:'Low',value:'low'},{label:'Medium',value:'medium'},{label:'High',value:'high'}] },
     { key: 'timeoutSec', label: 'Timeout (seconds)', type: 'number', default: 300 },
     { key: 'graceSec', label: 'Cancellation grace (seconds)', type: 'number', default: 10 },
+    { key: 'enableAccountRotation', label: 'Multiple account auto-rotation on quota exhaustion', type: 'toggle', default: true, hint: 'Auto-switches to next ready Google account when quota limit (429) is hit' },
+    { key: 'accountPoolFile', label: 'Custom account pool JSON path (optional)', type: 'text', hint: 'Defaults to ~/.paperclip/antigravity-accounts.json' },
     { key: 'promptTemplate', label: 'Paperclip prompt template (optional)', type: 'textarea', hint: 'Uses Paperclip placeholders like {{agent.name}}, {{context.taskTitle}}' },
   ],
 };
