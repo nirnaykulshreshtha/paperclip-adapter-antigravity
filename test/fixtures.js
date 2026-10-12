@@ -19,7 +19,15 @@ export function makeMockToken(email) {
 
 export async function fixture(t) {
   const root=await mkdtemp(path.join(tmpdir(),'agy-adapter-test-'));
-  t.after(async()=>rm(root,{force:true,recursive:true}));
+  const prevPoolEnv = process.env.PAPERCLIP_ANTIGRAVITY_ACCOUNT_POOL_FILE;
+  const prevTestPayload = process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD;
+  t.after(async()=>{
+    if (prevPoolEnv !== undefined) process.env.PAPERCLIP_ANTIGRAVITY_ACCOUNT_POOL_FILE = prevPoolEnv;
+    else delete process.env.PAPERCLIP_ANTIGRAVITY_ACCOUNT_POOL_FILE;
+    if (prevTestPayload !== undefined) process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD = prevTestPayload;
+    else delete process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD;
+    await rm(root,{force:true,recursive:true});
+  });
   const primary=path.join(root,'primary');const secondary=path.join(root,'pilot');
   await (await import('node:fs/promises')).mkdir(primary);
   await exec('git',['init','-q','-b','main',primary]);
@@ -31,6 +39,7 @@ export async function fixture(t) {
   await exec('git',['-C',primary,'worktree','add','-q','-b','pilot/test',secondary]);
   await writeFile(path.join(secondary,'.paperclip-antigravity-allow'),'ALLOW_PAPERCLIP_ANTIGRAVITY_LOCAL\n');
   const mockPoolFile = path.join(root, 'antigravity-accounts.json');
+  process.env.PAPERCLIP_ANTIGRAVITY_ACCOUNT_POOL_FILE = mockPoolFile;
   await writeFile(mockPoolFile, JSON.stringify({ version: 1, activeAccount: null, accounts: [] }));
   const exe=path.join(root,'agy-stub');
   await writeFile(exe,`#!/usr/bin/env node

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {writeFile, realpath, symlink} from 'node:fs/promises';
+import {readFile, writeFile, realpath, symlink} from 'node:fs/promises';
 import path from 'node:path';
 import {fixture,fakeContext,helpers,makeMockToken} from './fixtures.js';
 import {executeWithHelpers, formatToolProgress} from '../src/server/execute.js';
@@ -324,3 +324,66 @@ test('fails with provider_quota when all accounts in pool are exhausted', async 
   assert.match(res.errorMessage, /all available antigravity accounts exhausted quota/i);
   assert.equal(spawned.length, 2);
 });
+
+test('account pool operations strictly respect custom filePath and do not modify default pool', async (t) => {
+  const f = await fixture(t);
+  const acc = 'isolated@example.com';
+  const token = makeMockToken(acc);
+  const pool = {
+    version: 1,
+    activeAccount: acc,
+    accounts: [
+      { email: acc, tokenPayload: token, status: 'ready', expiry: '2099-01-01T00:00:00Z', quotaResetAt: null, lastUsedAt: null },
+    ],
+  };
+  await writeFile(f.mockPoolFile, JSON.stringify(pool, null, 2));
+
+  const { loadAccountPool, markAccountQuotaExhausted } = await import('../src/lib/account-pool.js');
+  const loaded = await loadAccountPool(f.mockPoolFile);
+  assert.equal(loaded._filePath, f.mockPoolFile);
+
+  await markAccountQuotaExhausted(acc, loaded, 60000, 'test cooldown', f.mockPoolFile);
+  const reloaded = JSON.parse(await readFile(f.mockPoolFile, 'utf8'));
+  assert.equal(reloaded.accounts[0].status, 'quota_exhausted');
+});
+
+test('individual model quota exhaustion segregates model cooldown and leaves gemini operational', async (t) => {
+  const f = await fixture(t);
+  const acc = 'mixed@example.com';
+  const token = makeMockToken(acc);
+  const pool = {
+    version: 1,
+    activeAccount: acc,
+    accounts: [
+      { email: acc, tokenPayload: token, status: 'ready', expiry: '2099-01-01T00:00:00Z', quotaResetAt: null, lastUsedAt: null },
+    ],
+  };
+  await writeFile(f.mockPoolFile, JSON.stringify(pool, null, 2));
+
+  const { loadAccountPool, markAccountQuotaExhausted, getNextReadyAccount, isAccountReadyForModel } = await import('../src/lib/account-pool.js');
+  const loaded = await loadAccountPool(f.mockPoolFile);
+
+  // Simulate Claude hitting its individual quota
+  await markAccountQuotaExhausted(acc, loaded, 1800000, 'error: Individual quota reached. Resets in 3h.', f.mockPoolFile, 'claude-sonnet-4-6');
+  const reloaded = JSON.parse(await readFile(f.mockPoolFile, 'utf8'));
+
+  // Account status remains ready because only Claude was exhausted
+  assert.equal(reloaded.accounts[0].status, 'ready');
+  assert.ok(reloaded.accounts[0].modelQuotas['claude-sonnet-4-6'].quotaResetAt > Date.now());
+
+  // Ready for Gemini Pro and Flash
+  assert.equal(isAccountReadyForModel(reloaded.accounts[0], 'gemini-3.1-pro-low'), true);
+  assert.equal(isAccountReadyForModel(reloaded.accounts[0], 'gemini-3.8-flash-high'), true);
+
+  // NOT ready for Claude Sonnet
+  assert.equal(isAccountReadyForModel(reloaded.accounts[0], 'claude-sonnet-4-6'), false);
+
+  // Pool candidate resolution respects model segregation
+  const geminiCandidate = getNextReadyAccount(reloaded, null, 'gemini-3.1-pro-low');
+  assert.ok(geminiCandidate);
+  assert.equal(geminiCandidate.email, acc);
+
+  const claudeCandidate = getNextReadyAccount(reloaded, null, 'claude-sonnet-4-6');
+  assert.equal(claudeCandidate, null);
+});
+

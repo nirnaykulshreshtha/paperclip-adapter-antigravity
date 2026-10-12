@@ -12,6 +12,7 @@ import { detectActiveAccount } from '../lib/account.js';
 import {
   loadAccountPool,
   syncKeychainToPool,
+  isAccountReadyForModel,
   getNextReadyAccount,
   activateAccount,
   markAccountQuotaExhausted,
@@ -333,23 +334,26 @@ export async function executeWithHelpers(ctx, helpers) {
     if (cfg.enableAccountRotation) {
       try {
         pool = await loadAccountPool(poolPath);
-        pool = await syncKeychainToPool(pool);
+        pool = await syncKeychainToPool(pool, poolPath);
         const now = Date.now();
         const activeEntry = pool.accounts.find(a => a.email.toLowerCase() === (pool.activeAccount || '').toLowerCase());
-        if (activeEntry && activeEntry.status === 'quota_exhausted' && activeEntry.quotaResetAt && now < activeEntry.quotaResetAt) {
-          const readyAcc = getNextReadyAccount(pool, activeEntry.email);
+        if (activeEntry && !isAccountReadyForModel(activeEntry, cfg.model)) {
+          const readyAcc = getNextReadyAccount(pool, activeEntry.email, cfg.model);
           if (readyAcc) {
-            const activated = await activateAccount(readyAcc.email, pool);
+            const activated = await activateAccount(readyAcc.email, pool, poolPath);
             if (activated) {
+              const cooldownMs = (activeEntry.quotaResetAt ? activeEntry.quotaResetAt - now : 0) ||
+                (activeEntry.modelQuotas?.[cfg.model]?.quotaResetAt ? activeEntry.modelQuotas[cfg.model].quotaResetAt - now : 0);
               await ctx.onEvent?.({
                 eventType: 'account.auto_switched',
                 stream: 'system',
                 level: 'warn',
-                message: `Active account '${activeEntry.email}' is currently on quota cooldown (resets in ${Math.round((activeEntry.quotaResetAt - now) / 60000)}m). Auto-switched to ready account '${readyAcc.email}'.`,
+                message: `Active account '${activeEntry.email}' is currently on quota cooldown${cooldownMs > 0 ? ` (resets in ${Math.round(cooldownMs / 60000)}m)` : ''}. Auto-switched to ready account '${readyAcc.email}'.`,
                 payload: {
                   previousAccount: activeEntry.email,
                   currentAccount: readyAcc.email,
-                  quotaResetAt: activeEntry.quotaResetAt,
+                  model: cfg.model,
+                  quotaResetAt: activeEntry.quotaResetAt || activeEntry.modelQuotas?.[cfg.model]?.quotaResetAt,
                 },
               });
             }
@@ -866,10 +870,10 @@ export async function executeWithHelpers(ctx, helpers) {
       const combined = `${proc.stderr || ''}\n${proc.reason || ''}\n${proc.final?.error || ''}`;
       const cooldownMs = parseQuotaResetDuration(combined);
       if (currentAccountEmail) {
-        await markAccountQuotaExhausted(currentAccountEmail, pool, cooldownMs, combined.slice(0, 500));
+        await markAccountQuotaExhausted(currentAccountEmail, pool, cooldownMs, combined.slice(0, 500), poolPath, cfg.model);
       }
 
-      const nextReady = getNextReadyAccount(pool, currentAccountEmail);
+      const nextReady = getNextReadyAccount(pool, currentAccountEmail, cfg.model);
       if (nextReady && !attemptedAccounts.has(nextReady.email.toLowerCase())) {
         rotationAttempts++;
         attemptedAccounts.add(nextReady.email.toLowerCase());
@@ -896,7 +900,7 @@ export async function executeWithHelpers(ctx, helpers) {
           lastEventAt: new Date(),
         });
 
-        const activated = await activateAccount(nextReady.email, pool);
+        const activated = await activateAccount(nextReady.email, pool, poolPath);
         if (activated) {
           currentAccountEmail = nextReady.email;
           resumeConvId = null;

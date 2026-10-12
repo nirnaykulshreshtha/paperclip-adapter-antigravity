@@ -22,23 +22,27 @@ export async function loadAccountPool(filePath = getAccountPoolPath()) {
     const raw = await readFile(filePath, 'utf8');
     const data = JSON.parse(raw);
     if (data && Array.isArray(data.accounts)) {
+      Object.defineProperty(data, '_filePath', { value: filePath, writable: true, enumerable: false });
       return data;
     }
   } catch {}
-  return {
+  const initial = {
     version: 1,
     activeAccount: null,
     accounts: [],
   };
+  Object.defineProperty(initial, '_filePath', { value: filePath, writable: true, enumerable: false });
+  return initial;
 }
 
 /**
  * Saves the account rotation pool to disk atomically.
  */
-export async function saveAccountPool(pool, filePath = getAccountPoolPath()) {
+export async function saveAccountPool(pool, filePath = pool?._filePath || getAccountPoolPath()) {
+  const targetPath = filePath || pool?._filePath || getAccountPoolPath();
   try {
-    await mkdir(path.dirname(filePath), { recursive: true });
-    await writeFile(filePath, JSON.stringify(pool, null, 2), 'utf8');
+    await mkdir(path.dirname(targetPath), { recursive: true });
+    await writeFile(targetPath, JSON.stringify(pool, null, 2), 'utf8');
     return true;
   } catch (err) {
     return false;
@@ -122,8 +126,21 @@ export async function writeKeychainPayload(tokenPayload, runner = execFileAsync,
 /**
  * Synchronizes the currently active OS keychain account into the account pool.
  */
-export async function syncKeychainToPool(pool, runner = execFileAsync, platform = process.platform) {
-  const rawPayload = await readKeychainPayload(runner, platform);
+export async function syncKeychainToPool(pool, filePathOrRunner = pool?._filePath, runnerOrPlatform = execFileAsync, platform = process.platform) {
+  let targetFilePath = pool?._filePath || getAccountPoolPath();
+  let runner = execFileAsync;
+  let targetPlatform = process.platform;
+
+  if (typeof filePathOrRunner === 'function') {
+    runner = filePathOrRunner;
+    targetPlatform = typeof runnerOrPlatform === 'string' ? runnerOrPlatform : process.platform;
+  } else {
+    if (typeof filePathOrRunner === 'string' && filePathOrRunner) targetFilePath = filePathOrRunner;
+    if (typeof runnerOrPlatform === 'function') runner = runnerOrPlatform;
+    if (typeof platform === 'string') targetPlatform = platform;
+  }
+
+  const rawPayload = await readKeychainPayload(runner, targetPlatform);
   if (!rawPayload) return pool;
 
   const parsed = parseKeyringPayload(rawPayload);
@@ -149,14 +166,50 @@ export async function syncKeychainToPool(pool, runner = execFileAsync, platform 
   }
 
   pool.activeAccount = parsed.email;
-  await saveAccountPool(pool);
+  await saveAccountPool(pool, targetFilePath);
   return pool;
+}
+
+/**
+ * Checks whether an account is ready for use, optionally considering a specific model.
+ */
+export function isAccountReadyForModel(account, model = null) {
+  if (!account) return false;
+  const now = Date.now();
+
+  // If the account has an explicit non-ready status other than quota_exhausted, not ready
+  if (account.status && account.status !== 'ready' && account.status !== 'quota_exhausted') {
+    return false;
+  }
+
+  // Check model-specific quota cooldown
+  if (model && account.modelQuotas && account.modelQuotas[model]) {
+    const mQuota = account.modelQuotas[model];
+    if (mQuota.quotaResetAt && now < mQuota.quotaResetAt) {
+      return false;
+    }
+  }
+
+  // If the account has a general quota cooldown
+  if (account.quotaResetAt && now < account.quotaResetAt) {
+    // If the account exhausted an individual/Claude model, and the requested model is Gemini, allow it
+    const isClaudeQuota = (account.quotaResetModel && account.quotaResetModel.startsWith('claude-')) ||
+      (typeof account.lastError === 'string' && /individual quota reached/i.test(account.lastError));
+    const isGeminiModel = typeof model === 'string' && model.startsWith('gemini-');
+
+    if (isClaudeQuota && isGeminiModel) {
+      return true;
+    }
+    return false;
+  }
+
+  return account.status === 'ready' || (!account.quotaResetAt || now >= account.quotaResetAt);
 }
 
 /**
  * Finds the next available account in the pool that has available quota.
  */
-export function getNextReadyAccount(pool, excludeEmail = null) {
+export function getNextReadyAccount(pool, excludeEmail = null, targetModel = null) {
   if (!pool || !Array.isArray(pool.accounts) || pool.accounts.length === 0) return null;
   const now = Date.now();
 
@@ -166,12 +219,23 @@ export function getNextReadyAccount(pool, excludeEmail = null) {
       acc.status = 'ready';
       acc.quotaResetAt = null;
     }
+    if (acc.modelQuotas) {
+      for (const [m, q] of Object.entries(acc.modelQuotas)) {
+        if (q.quotaResetAt && now >= q.quotaResetAt) {
+          delete acc.modelQuotas[m];
+        }
+      }
+    }
+    // If the account was previously marked quota_exhausted solely due to individual Claude quota, heal it
+    if (acc.status === 'quota_exhausted' && typeof acc.lastError === 'string' && /individual quota reached/i.test(acc.lastError)) {
+      acc.status = 'ready';
+    }
   }
 
   // Find eligible candidate
   const candidates = pool.accounts.filter(a => {
     if (excludeEmail && a.email.toLowerCase() === excludeEmail.toLowerCase()) return false;
-    return a.status === 'ready' || (!a.quotaResetAt || now >= a.quotaResetAt);
+    return isAccountReadyForModel(a, targetModel);
   });
 
   if (candidates.length === 0) return null;
@@ -189,31 +253,76 @@ export function getNextReadyAccount(pool, excludeEmail = null) {
 /**
  * Activates an account by writing its credentials to the keychain and updating pool state.
  */
-export async function activateAccount(email, pool, runner = execFileAsync, platform = process.platform) {
+export async function activateAccount(email, pool, filePathOrRunner = pool?._filePath, runnerOrPlatform = execFileAsync, platform = process.platform) {
   if (!email || !pool || !Array.isArray(pool.accounts)) return false;
   const target = pool.accounts.find(a => a.email.toLowerCase() === email.toLowerCase());
   if (!target || !target.tokenPayload) return false;
 
-  const success = await writeKeychainPayload(target.tokenPayload, runner, platform);
+  let targetFilePath = pool?._filePath || getAccountPoolPath();
+  let runner = execFileAsync;
+  let targetPlatform = process.platform;
+
+  if (typeof filePathOrRunner === 'function') {
+    runner = filePathOrRunner;
+    targetPlatform = typeof runnerOrPlatform === 'string' ? runnerOrPlatform : process.platform;
+  } else {
+    if (typeof filePathOrRunner === 'string' && filePathOrRunner) targetFilePath = filePathOrRunner;
+    if (typeof runnerOrPlatform === 'function') runner = runnerOrPlatform;
+    if (typeof platform === 'string') targetPlatform = platform;
+  }
+
+  const success = await writeKeychainPayload(target.tokenPayload, runner, targetPlatform);
   if (!success) return false;
 
   pool.activeAccount = target.email;
   target.lastUsedAt = new Date().toISOString();
-  await saveAccountPool(pool);
+  await saveAccountPool(pool, targetFilePath);
   return true;
 }
 
 /**
  * Marks an account as quota-exhausted with a reset cooldown.
+ * If model is specified and is an individual model (e.g. Claude), segregates quota cooldown
+ * so Google Gemini models remain operational on the host account.
  */
-export async function markAccountQuotaExhausted(email, pool, cooldownMs, reason = 'RESOURCE_EXHAUSTED 429') {
+export async function markAccountQuotaExhausted(
+  email,
+  pool,
+  cooldownMs,
+  reason = 'RESOURCE_EXHAUSTED 429',
+  filePath = pool?._filePath || getAccountPoolPath(),
+  model = null
+) {
   if (!email || !pool || !Array.isArray(pool.accounts)) return;
   const target = pool.accounts.find(a => a.email.toLowerCase() === email.toLowerCase());
   if (target) {
-    target.status = 'quota_exhausted';
-    target.quotaResetAt = Date.now() + cooldownMs;
-    target.lastError = reason;
-    target.quotaExhaustedAt = new Date().toISOString();
-    await saveAccountPool(pool);
+    const isIndividualModelQuota = typeof reason === 'string' && /individual quota reached/i.test(reason);
+    const isClaudeModel = typeof model === 'string' && model.startsWith('claude-');
+
+    target.modelQuotas = target.modelQuotas || {};
+    if (model) {
+      target.modelQuotas[model] = {
+        quotaResetAt: Date.now() + cooldownMs,
+        reason,
+        exhaustedAt: new Date().toISOString(),
+      };
+      target.quotaResetModel = model;
+    }
+
+    if (isIndividualModelQuota || isClaudeModel) {
+      // Third-party model quota reached its individual limit.
+      // Do NOT exhaust the overall Google account status so Gemini models remain operational.
+      target.lastError = `[${model || 'individual_model'}] ${reason}`;
+      if (!target.status || target.status === 'ready') {
+        target.status = 'ready';
+      }
+    } else {
+      target.status = 'quota_exhausted';
+      target.quotaResetAt = Date.now() + cooldownMs;
+      target.lastError = reason;
+      target.quotaExhaustedAt = new Date().toISOString();
+    }
+    await saveAccountPool(pool, filePath);
   }
 }
+
