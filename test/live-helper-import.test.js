@@ -4,7 +4,7 @@ import { fixture, fakeContext } from './fixtures.js';
 import { execute } from '../src/server/execute.js';
 test('public execute resolves the declared real Paperclip helper dependency', async t => {
   const f = await fixture(t);
-  const { ctx } = fakeContext(f.config);
+  const { ctx } = fakeContext({ ...f.config, validateSelectedModelOnRun: false });
   const result = await execute(ctx);
   assert.equal(result.exitCode, 0, JSON.stringify(result));
 });

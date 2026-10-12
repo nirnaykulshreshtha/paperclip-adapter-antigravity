@@ -4,6 +4,7 @@ import {promisify} from 'node:util';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 process.env.NODE_ENV = 'test';
+export const FIXTURE_SUITE_VERSION = '0.3.2';
 const exec=promisify(execFile);
 
 export function makeMockToken(email) {
@@ -43,10 +44,12 @@ export async function fixture(t) {
   await writeFile(mockPoolFile, JSON.stringify({ version: 1, activeAccount: null, accounts: [] }));
   const exe=path.join(root,'agy-stub');
   await writeFile(exe,`#!/usr/bin/env node
+if(process.argv.includes('models')){console.log('gemini-3.8-flash-low    Gemini 3.8 Flash Low');process.exit(0);}
 let chunks='';
 process.stdin.on('data',d=>chunks+=d);
 process.stdin.on('end',()=>{
  if(process.argv.includes('--version')){console.log('agy 1.3.3');process.exit(0);}
+ if(process.argv.includes('models')){console.log('gemini-3.8-flash-low    Gemini 3.8 Flash Low');process.exit(0);}
  if(process.argv.includes('--dangerously-skip-permissions') || !process.argv.includes('--sandbox')){console.error('unsafe flags');process.exit(2);}
  const message=JSON.parse(chunks.trim()); const prompt=message.message.content;
  const scenario=prompt.match(/SCENARIO_([A-Z_]+)/)?.[1]||'OK';
@@ -80,7 +83,7 @@ process.stdin.on('end',()=>{
 });
 `);
   await chmod(exe,0o755);
-  const config={command:exe,cwd:secondary,allowedWorkspaceRoot:secondary,executionMode:'planning',model:'gemini-3.8-flash-low',timeoutSec:30,accountPoolFile:mockPoolFile};
+  const config={command:exe,cwd:secondary,allowedWorkspaceRoot:secondary,executionMode:'planning',model:'gemini-3.8-flash-low',timeoutSec:30,accountPoolFile:mockPoolFile,validateSelectedModelOnRun:true};
   return {root,primary,secondary,exe,config,mockPoolFile};
 }
 export function fakeContext(config, taskTitle='SCENARIO_OK') {
@@ -95,4 +98,9 @@ export const helpers={
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE:'Agent {{agent.name}} / {{runId}}',
   renderTemplate:(s,data)=>s.replace(/{{\s*([\w.]+)\s*}}/g,(_m,k)=>k==='agent.name'?data.agent.name:k==='runId'?data.runId:''),
   buildPaperclipEnv: agent=>({PAPERCLIP_AGENT_ID:agent.id,PAPERCLIP_COMPANY_ID:agent.companyId}),
+};
+
+/** Deterministic model discovery for unit tests. Not wired to exported execute(ctx). */
+export const testDeps = {
+  discoverModels: async () => [{ id: 'gemini-3.8-flash-low', label: 'Fixture model' }],
 };

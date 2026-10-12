@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { mkdtemp, mkdir, writeFile, symlink, access, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { fixture, fakeContext, helpers } from './fixtures.js';
+import { fixture, fakeContext, helpers ,testDeps} from './fixtures.js';
 import { createServerAdapter } from '../src/server/index.js';
 import { buildPrompt, executeWithHelpers } from '../src/server/execute.js';
 import { listSkills, syncSkills, stageAssignedSkills } from '../src/lib/skills.js';
@@ -68,7 +68,7 @@ test('planning agent receives staged skill path for CLI and cleans after complet
    await assert.rejects(access(path.join(root,'.agents','skills','not-selected','SKILL.md')));
    seen=true;
  };
- const result=await executeWithHelpers(ctx,helpers);
+ const result=await executeWithHelpers(ctx, helpers, testDeps);
  assert.equal(result.exitCode,0,JSON.stringify(result));
  assert.equal(seen,true);
  await assert.rejects(access(root),'skill staging must be gone after the command');
@@ -80,7 +80,7 @@ test('missing assigned skill fails closed BEFORE dispatch',async t=>{
  const snap=await listSkills({adapterType:'antigravity_local',config:cfg});
  assert.equal(snap.entries[1].state,'missing');
  const {ctx,spawned}=fakeContext(cfg);
- const outcome=await executeWithHelpers(ctx,helpers);
+ const outcome=await executeWithHelpers(ctx, helpers, testDeps);
  assert.notEqual(outcome.exitCode,0);
  assert.match(outcome.errorMessage,/Assigned skill.*unavailable/);
  assert.equal(spawned.length,0);
@@ -109,7 +109,7 @@ test('cleans staged skills even when Antigravity returns an execution error',asy
  const {ctx}=fakeContext(configWithSkills(f.config,s),'SCENARIO_ERROR');
  let stageRoot='';
  ctx.onMeta=async meta=>{const n=meta.commandArgs.indexOf('--add-dir');stageRoot=meta.commandArgs[n+1];};
- const result=await executeWithHelpers(ctx,helpers);
+ const result=await executeWithHelpers(ctx, helpers, testDeps);
  assert.notEqual(result.exitCode,0);
  assert.ok(stageRoot);
  await assert.rejects(access(stageRoot));

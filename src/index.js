@@ -12,8 +12,10 @@ export const agentConfigurationDoc = `# Antigravity CLI — Paperclip workspace-
 - Planning tasks pass --mode=plan and --sandbox. Implementation mode passes --mode=default, requires enableImplementation=true, a task ID and execution workspace ID.
 - Never use production credentials in agent worktrees. Terminal sandbox is not OS-level isolation. Permission denial is an error.
 - No agent may merge, deploy, execute production database migrations, or push automatically. Protect main using branch permissions and human review outside this adapter.
-- Session resume requires the same task and canonical workspace, and (if previously bound) the same workspace ID.
+- Sessions resume only for the same task, worktree, account, model and (if bound) workspace ID.
 - Legacy fixed-worktree mode remains available for temporary pilot testing. Upgrade to paperclip mode for implementation.
-- Set probeAuthentication=false after authenticating once; probes use account tokens.
+- AGY terminal /statusline can publish account and quota observations to a sanitized private file; this never switches authentication.
+- Provider thinking text cannot be reconstructed from thinking-token usage alone.
+- Dollar costs remain unpriced until trustworthy billing records are available.
 `;
-export { createServerAdapter } from './server/index.js?v=0.2.11';
+export { createServerAdapter } from './server/index.js';

@@ -1,7 +1,7 @@
 {
   "name": "paperclip-adapter-antigravity",
-  "version": "0.2.12",
-  "description": "Google Antigravity (AGY) CLI adapter for Paperclip AI agent orchestration with real-time UI streaming, multi-turn session persistence, and fail-closed security",
+  "version": "0.3.2",
+  "description": "Native Paperclip Antigravity CLI adapter with live models, observed account/quota sync, session-safe execution, audited transcripts and explicit unpriced billing",
   "type": "module",
   "author": "Nirnay Kulshreshtha <nirnaykulshreshtha@gmail.com>",
   "license": "MIT",
@@ -40,14 +40,18 @@
   },
   "files": [
     "src",
+    "scripts/statusline-snapshot.mjs",
+    "scripts/doctor.mjs",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
     "test": "node --test test/*.test.js",
-    "check": "node --check src/index.js && node --check src/ui/parse-stdout.js && node --check src/server/execute.js && node --check src/server/test.js && node --check src/lib/process.js && node --check src/lib/models.js && node --check src/lib/probe.js && node --check src/lib/assigned-workspace.js && node --check src/lib/skills.js && node --check src/lib/pricing.js",
+    "check": "node --check src/index.js && node --check src/server/index.js && node --check src/server/execute.js && node --check src/server/test.js && node --check src/ui/parse-stdout.js && node --check src/lib/account.js && node --check src/lib/account-pool.js && node --check src/lib/statusline.js && node --check src/lib/usage.js && node --check src/lib/quota.js && node --check src/lib/models.js && node --check src/lib/process.js && node --check src/lib/pricing.js && node --check scripts/statusline-snapshot.mjs",
     "smoke": "node scripts/local-smoke.js",
-    "models:check": "node scripts/check-models.js"
+    "models:check": "node scripts/check-models.js",
+    "doctor": "node scripts/doctor.mjs"
   },
   "dependencies": {
     "@paperclipai/adapter-utils": "2026.1005.0"

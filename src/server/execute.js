@@ -7,17 +7,11 @@ import { resolveAssignedWorkspace } from '../lib/assigned-workspace.js';
 import { stageAssignedSkills } from '../lib/skills.js';
 import { runAgy } from '../lib/process.js';
 import { errorText, looksLikePermissionDenial, sessionIdFrom, usageOf, isObj } from '../lib/result.js';
-import { estimateCostUsd } from '../lib/pricing.js';
-import { detectActiveAccount } from '../lib/account.js';
-import {
-  loadAccountPool,
-  syncKeychainToPool,
-  isAccountReadyForModel,
-  getNextReadyAccount,
-  activateAccount,
-  markAccountQuotaExhausted,
-  parseQuotaResetDuration,
-} from '../lib/account-pool.js';
+import { usageSince } from '../lib/usage.js';
+import { discoverAgyModels } from '../lib/models.js';
+import { detectActiveAccount, detectHeadlessKeychainAccount } from '../lib/account.js';
+import { readObservedStatus } from '../lib/statusline.js';
+import { loadAccountPool, syncKeychainToPool, markAccountQuotaExhausted, parseQuotaResetDuration } from '../lib/account-pool.js';
 
 const safeText=(v,max=5000)=>typeof v==='string'?v.slice(0,max):'';
 const maybeStr=(v)=>typeof v==='string'?v:'';
@@ -240,10 +234,28 @@ export function buildPrompt(ctx, cfg, instr, helpers, skillIndex = '', options =
   if(Buffer.byteLength(prompt,'utf8')>cfg.maxPromptBytes)throw new Error('Prompt exceeds maxPromptBytes; shorten task context/instructions');
   return prompt;
 }
+/** Redact secret-shaped keys and the run-scoped bearer token before Paperclip persistence. */
+export function sanitizeTelemetry(value, authToken, depth=0) {
+  if (depth>12) return '[OMITTED]';
+  if (typeof value==='string') return authToken?.length>4 ? value.replaceAll(authToken,'[REDACTED_TOKEN]') : value;
+  if (Array.isArray(value)) return value.slice(0,150).map(x=>sanitizeTelemetry(x,authToken,depth+1));
+  if (!value || typeof value!=='object') return value;
+  const out={};
+  for(const [key,v] of Object.entries(value).slice(0,150)) out[key] =
+    /(?:password|(?:access|refresh|id|auth)[_-]?token|api[_-]?key|secret|authorization|cookie)/i.test(key)
+    ? '[REDACTED]' : sanitizeTelemetry(v,authToken,depth+1);
+  return out;
+}
 /** Official helper injection allows deterministic tests without live Paperclip or agy. */
-export async function executeWithHelpers(ctx, helpers) {
+/**
+ * Execute a Paperclip turn. Live model discovery is the production default.
+ * Tests may inject a deterministic discovery function through the third argument;
+ * this never modifies Paperclip's exported execute(ctx) entry point.
+ */
+export async function executeWithHelpers(ctx, helpers, { discoverModels = discoverAgyModels } = {}) {
   let spawned=false;
   let stagedSkills=null;
+  const emitEvent=event=>ctx.onEvent?.(sanitizeTelemetry(event,ctx.authToken));
   try {
     if (typeof ctx.authToken !== 'string' || !ctx.authToken.trim()) {
       throw new Error('Antigravity execution requires a host-issued run-scoped Paperclip API token');
@@ -260,9 +272,9 @@ export async function executeWithHelpers(ctx, helpers) {
         exitCode: 0,
         signal: null,
         timedOut: false,
-        provider: 'google',
-        biller: 'google',
-        billingType: 'metered_api',
+        provider: 'antigravity',
+        biller: 'antigravity',
+        billingType: 'external_cli_unverified',
         model: cfg.model,
         costStatus: 'unpriced',
         summary: `Agent ${ctx.agent?.name || 'idle'}: heartbeat completed. No active task assigned.`,
@@ -287,10 +299,18 @@ export async function executeWithHelpers(ctx, helpers) {
     if(cfg.executionMode==='planning' && (await worktreeStatus(cwd)).length) {
       throw new Error('Planning requires a clean worktree (except the opt-in sentinel)');
     }
+    // Preflight authorization must run BEFORE potentially slow external CLI discovery.
+    // Unit tests inject deterministic discovery without changing production behavior.
+    if (cfg.validateSelectedModelOnRun) {
+      const available = await discoverModels({ config: cfg });
+      if (!Array.isArray(available) || !available.some(entry => entry?.id === cfg.model)) {
+        throw new Error(`Model ${cfg.model} is no longer available for the AGY account; refresh Paperclip's model list.`);
+      }
+    }
     if (cfg.executionMode === 'implementation') {
       const behindMain = await checkBranchFreshness(cwd);
       if (behindMain > 0) {
-        await ctx.onEvent?.({
+        await emitEvent({
           eventType: 'worktree.behind_main',
           stream: 'system',
           level: 'warn',
@@ -329,74 +349,37 @@ export async function executeWithHelpers(ctx, helpers) {
     if (oldId && typeof previous?.cwd === 'string' && path.isAbsolute(previous.cwd)) {
       previousCwd = await realpath(previous.cwd).catch(() => null);
     }
-    let pool = null;
-    const poolPath = cfg.accountPoolFile || undefined;
-    if (cfg.enableAccountRotation) {
-      try {
-        pool = await loadAccountPool(poolPath);
-        pool = await syncKeychainToPool(pool, poolPath);
-        const now = Date.now();
-        const activeEntry = pool.accounts.find(a => a.email.toLowerCase() === (pool.activeAccount || '').toLowerCase());
-        if (activeEntry && !isAccountReadyForModel(activeEntry, cfg.model)) {
-          const readyAcc = getNextReadyAccount(pool, activeEntry.email, cfg.model);
-          if (readyAcc) {
-            const activated = await activateAccount(readyAcc.email, pool, poolPath);
-            if (activated) {
-              const cooldownMs = (activeEntry.quotaResetAt ? activeEntry.quotaResetAt - now : 0) ||
-                (activeEntry.modelQuotas?.[cfg.model]?.quotaResetAt ? activeEntry.modelQuotas[cfg.model].quotaResetAt - now : 0);
-              await ctx.onEvent?.({
-                eventType: 'account.auto_switched',
-                stream: 'system',
-                level: 'warn',
-                message: `Active account '${activeEntry.email}' is currently on quota cooldown${cooldownMs > 0 ? ` (resets in ${Math.round(cooldownMs / 60000)}m)` : ''}. Auto-switched to ready account '${readyAcc.email}'.`,
-                payload: {
-                  previousAccount: activeEntry.email,
-                  currentAccount: readyAcc.email,
-                  model: cfg.model,
-                  quotaResetAt: activeEntry.quotaResetAt || activeEntry.modelQuotas?.[cfg.model]?.quotaResetAt,
-                },
-              });
-            }
-          }
-        }
-      } catch {}
+    const observed = await readObservedStatus().catch(()=>null);
+    const activeAccount=await detectActiveAccount().catch(()=>null);
+    const currentAccountEmail=activeAccount?.email||null;
+    if(currentAccountEmail) {
+      const file=cfg.accountPoolFile||undefined;
+      await syncKeychainToPool(await loadAccountPool(file),file);
     }
-
-    const activeAccount = await detectActiveAccount().catch(() => null);
-    let currentAccountEmail = activeAccount?.email || pool?.activeAccount || null;
-    const previousAccount = previous?.account || null;
-    const accountChanged = Boolean(previousAccount && currentAccountEmail && previousAccount !== currentAccountEmail);
-    if (accountChanged) {
-      await ctx.onEvent?.({
-        eventType: 'account.switched',
-        stream: 'system',
-        level: 'info',
-        message: `Active account switched from '${previousAccount}' to '${currentAccountEmail}'. Starting fresh conversation session for new account.`,
-        payload: {
-          previousAccount,
-          currentAccount: currentAccountEmail,
-          authMethod: activeAccount?.authMethod || 'consumer',
-        },
-      });
+    const headlessKeychain=await detectHeadlessKeychainAccount().catch(()=>null);
+    if(observed?.email && headlessKeychain?.email && observed.email!==headlessKeychain.email)
+      throw new Error('AGY terminal account and headless credential account disagree. Reauthenticate and refresh AGY status before executing.');
+    const previousAccount=previous?.account||null;
+    const accountChanged=Boolean(previousAccount && currentAccountEmail && previousAccount!==currentAccountEmail);
+    if(currentAccountEmail) {
+      await emitEvent({eventType:'account.active',stream:'system',level:'info',
+        message:`Observed AGY account: ${currentAccountEmail}`,
+        payload:{email:currentAccountEmail,source:activeAccount.source||'unknown',model:observed?.model??null}});
+    } else {
+      await emitEvent({eventType:'account.unknown',stream:'system',level:'warn',
+        message:'Could not observe current AGY account; use /statusline hook in the interactive terminal'});
     }
-    if (currentAccountEmail) {
-      await ctx.onEvent?.({
-        eventType: 'account.active',
-        stream: 'system',
-        level: 'info',
-        message: `Active Antigravity account: ${currentAccountEmail}`,
-        payload: {
-          email: currentAccountEmail,
-          authMethod: activeAccount?.authMethod || 'consumer',
-          expired: activeAccount?.expired || false,
-        },
-      });
-    }
-    const forceFresh = Boolean(ctx.context?.forceFreshSession || accountChanged);
+    if(accountChanged)await emitEvent({eventType:'account.switched',stream:'system',level:'info',
+      message:'AGY account changed; starting a fresh session',
+      payload:{previousAccount,currentAccount:currentAccountEmail}});
+    const modelChanged=Boolean(previous?.model && previous.model!==cfg.model);
+    const previousAccountNowUnknown=Boolean(previousAccount && !currentAccountEmail);
+    const forceFresh=Boolean(ctx.context?.forceFreshSession || accountChanged || modelChanged || previousAccountNowUnknown);
     const canResume = Boolean(!forceFresh && oldId && previousCwd === cwd &&
       (!previous.taskKey || previous.taskKey === taskKey) &&
       (!previous.workspaceId || previous.workspaceId === workspaceId) &&
-      (!previous.account || !currentAccountEmail || previous.account === currentAccountEmail));
+      (!previous.model || previous.model===cfg.model) &&
+      (!previous.account || previous.account===currentAccountEmail));
     if (oldId && !canResume && !forceFresh) {
       throw new Error('Stored conversation belongs to another workspace or task; reset the Paperclip session before retrying');
     }
@@ -439,14 +422,17 @@ export async function executeWithHelpers(ctx, helpers) {
     ctx.onDispatch?.();
     let permissionFailure=false;
     let logChars=0;
+    let logTruncated=false;
     const log = async (stream,text) => {
       // Stream model text and sanitized tool progress. Never print raw credentials or unbounded raw data.
       if (typeof text !== 'string' || !text) return;
       if (ctx.authToken && typeof ctx.authToken === 'string' && ctx.authToken.length > 4) {
         text = text.replaceAll(ctx.authToken, '[REDACTED_TOKEN]');
       }
-      if(logChars>300_000)return;
-      const limited=text.slice(0,Math.max(0,300_000-logChars));logChars+=limited.length;
+      if(logChars>=cfg.maxOutputBytes){logTruncated=true;return;}
+      const limited=text.slice(0,Math.max(0,cfg.maxOutputBytes-logChars));
+      if(limited.length<text.length)logTruncated=true;
+      logChars+=limited.length;
       if(limited) await ctx.onLog(stream,limited);
     };
     const emitAcpx = async (payload) => {
@@ -509,33 +495,9 @@ export async function executeWithHelpers(ctx, helpers) {
     const activeToolCalls = new Map();
 
     let resumeConvId = canResume ? oldId : null;
+    const runArgs=buildArgs(cfg.model,resumeConvId);
     let proc = null;
-    const attemptedAccounts = new Set();
-    if (currentAccountEmail) attemptedAccounts.add(currentAccountEmail.toLowerCase());
-
-    const maxRotations = cfg.enableAccountRotation && pool && pool.accounts.length > 1
-      ? pool.accounts.length
-      : 1;
-    let rotationAttempts = 0;
-
-    while (true) {
-      const runArgs = buildArgs(cfg.model, resumeConvId);
-      if (rotationAttempts > 0) {
-        await ctx.onMeta?.({
-          adapterType: 'antigravity_local',
-          command: cfg.command,
-          cwd,
-          commandArgs: runArgs,
-          workspaceId,
-          commandNotes: [
-            'Prompt sent via stdin; secrets omitted',
-            ...(currentAccountEmail ? [`Rotated to account: ${currentAccountEmail}`] : []),
-            'Paperclip-assigned issue worktree verified',
-            'Sandbox enabled; permissions governed by agy user settings',
-          ],
-        });
-      }
-
+    // The CLI owns account selection. Never re-run side-effectful turns under a different account.
       proc = await runAgy({
         command: cfg.command,
         args: runArgs,
@@ -554,7 +516,7 @@ export async function executeWithHelpers(ctx, helpers) {
           lastAssistantSnippet: null,
           lastEventAt: new Date(),
         });
-        await ctx.onEvent?.({
+        await emitEvent({
           eventType: 'harness.starting',
           stream: 'system',
           level: 'info',
@@ -584,7 +546,7 @@ export async function executeWithHelpers(ctx, helpers) {
             permissionMode: evt.init?.permission_mode || (cfg.allowUnattendedRuntime ? 'always-proceed' : 'sandbox'),
             sessionId: convId,
           });
-          await ctx.onEvent?.({
+          await emitEvent({
             eventType: 'harness.ready',
             stream: 'system',
             level: 'info',
@@ -596,7 +558,7 @@ export async function executeWithHelpers(ctx, helpers) {
               permissionMode: evt.init?.permission_mode,
             },
           });
-          await ctx.onEvent?.({
+          await emitEvent({
             eventType: canResume ? 'session.resumed' : 'session.started',
             stream: 'system',
             level: 'info',
@@ -618,7 +580,7 @@ export async function executeWithHelpers(ctx, helpers) {
         if(evt.event==='step_update' && isObj(evt.step_update)) {
           const s=evt.step_update;
           if(s.step_type==='user_input' && s.state==='DONE') {
-            await ctx.onEvent?.({
+            await emitEvent({
               eventType: 'turn.started',
               stream: 'system',
               level: 'info',
@@ -668,7 +630,7 @@ export async function executeWithHelpers(ctx, helpers) {
               });
 
               // Canonical Paperclip tool execution started event with required schema
-              await ctx.onEvent?.({
+              await emitEvent({
                 eventType: 'tool.execution.started',
                 stream: 'system',
                 level: 'info',
@@ -696,7 +658,7 @@ export async function executeWithHelpers(ctx, helpers) {
 
               if(toolName === 'invoke_subagent') {
                 const role = p.Role || p.TypeName || (Array.isArray(p.Subagents) ? p.Subagents.map(x=>x.Role||x.TypeName).join(', ') : 'subagent');
-                await ctx.onEvent?.({
+                await emitEvent({
                   eventType: 'delegation.started',
                   stream: 'system',
                   level: 'info',
@@ -712,7 +674,7 @@ export async function executeWithHelpers(ctx, helpers) {
                   },
                 });
               } else if(toolName === 'search_web' || toolName === 'read_url_content') {
-                await ctx.onEvent?.({
+                await emitEvent({
                   eventType: 'research.started',
                   stream: 'system',
                   level: 'info',
@@ -763,7 +725,7 @@ export async function executeWithHelpers(ctx, helpers) {
 
               // Canonical Paperclip tool execution completed event with full output audit
               const boundedOut = safeText(outputText, 65536);
-              await ctx.onEvent?.({
+              await emitEvent({
                 eventType: 'tool.execution.completed',
                 stream: 'system',
                 level: isError ? 'warn' : 'info',
@@ -791,7 +753,7 @@ export async function executeWithHelpers(ctx, helpers) {
               });
 
               if(toolName === 'invoke_subagent') {
-                await ctx.onEvent?.({
+                await emitEvent({
                   eventType: 'delegation.completed',
                   stream: 'system',
                   level: isError ? 'warn' : 'info',
@@ -804,7 +766,7 @@ export async function executeWithHelpers(ctx, helpers) {
                   },
                 });
               } else if(toolName === 'search_web' || toolName === 'read_url_content') {
-                await ctx.onEvent?.({
+                await emitEvent({
                   eventType: 'research.completed',
                   stream: 'system',
                   level: isError ? 'warn' : 'info',
@@ -819,20 +781,13 @@ export async function executeWithHelpers(ctx, helpers) {
               }
 
               await emitAcpx({
-                type: 'acpx.tool_call',
-                name: toolName,
-                toolCallId: callId,
-                status: isError ? 'failed' : 'completed',
-                text: finalTarget || toolName,
-                input: finalParams,
-              });
-              await emitAcpx({
                 type: 'acpx.tool_result',
                 toolUseId: callId,
                 toolName,
                 name: toolName,
-                content: outputText || (isError ? errText : 'completed'),
-                output: outputText || (isError ? errText : 'completed'),
+                content: safeText(outputText || (isError ? errText : 'completed'),65536),
+                output: safeText(outputText || (isError ? errText : 'completed'),65536),
+                outputTruncated: outputText.length>65536,
                 isError,
               });
             }
@@ -841,7 +796,7 @@ export async function executeWithHelpers(ctx, helpers) {
           }
 
           if(isObj(s.usage)) {
-            await ctx.onEvent?.({
+            await emitEvent({
               eventType: 'usage.reported',
               stream: 'system',
               level: 'info',
@@ -865,55 +820,11 @@ export async function executeWithHelpers(ctx, helpers) {
       onStderr: async (text) => { if (looksLikePermissionDenial(text)) permissionFailure = true; },
     });
 
-    const classification = classifyError(proc);
-    if (classification?.errorCode === 'provider_quota' && cfg.enableAccountRotation && pool && rotationAttempts < maxRotations) {
-      const combined = `${proc.stderr || ''}\n${proc.reason || ''}\n${proc.final?.error || ''}`;
-      const cooldownMs = parseQuotaResetDuration(combined);
-      if (currentAccountEmail) {
-        await markAccountQuotaExhausted(currentAccountEmail, pool, cooldownMs, combined.slice(0, 500), poolPath, cfg.model);
-      }
-
-      const nextReady = getNextReadyAccount(pool, currentAccountEmail, cfg.model);
-      if (nextReady && !attemptedAccounts.has(nextReady.email.toLowerCase())) {
-        rotationAttempts++;
-        attemptedAccounts.add(nextReady.email.toLowerCase());
-
-        await ctx.onEvent?.({
-          eventType: 'account.auto_switched',
-          stream: 'system',
-          level: 'warn',
-          message: `Account '${currentAccountEmail}' exhausted quota (${Math.round(cooldownMs / 60000)}m cooldown). Auto-rotating to ready account '${nextReady.email}' and retrying turn with model ${cfg.model}.`,
-          payload: {
-            previousAccount: currentAccountEmail,
-            currentAccount: nextReady.email,
-            cooldownMs,
-            model: cfg.model,
-            rotationAttempt: rotationAttempts,
-          },
-        });
-
-        await ctx.onRuntimeProgress?.({
-          phase: 'run_activity',
-          message: `Switched account to ${nextReady.email}; retrying turn with ${cfg.model}...`,
-          currentToolName: null,
-          lastAssistantSnippet: null,
-          lastEventAt: new Date(),
-        });
-
-        const activated = await activateAccount(nextReady.email, pool, poolPath);
-        if (activated) {
-          currentAccountEmail = nextReady.email;
-          resumeConvId = null;
-          activeToolCalls.clear();
-          lastAssistantSnippet = '';
-          permissionFailure = false;
-          continue;
-        }
-      }
+    if(classifyError(proc)?.errorCode==='provider_quota' && currentAccountEmail) {
+      const detail=`${proc.stderr||''} ${proc.reason||''} ${proc.final?.error||''}`;
+      await markAccountQuotaExhausted(currentAccountEmail,null,parseQuotaResetDuration(detail),'provider_quota',
+        cfg.accountPoolFile||undefined,cfg.model).catch(()=>{});
     }
-
-    break;
-  }
   const classification = classifyError(proc);
     const fail=(message,clearSession=false,extra={})=>{
       ctx.onRuntimeProgress?.({
@@ -923,7 +834,7 @@ export async function executeWithHelpers(ctx, helpers) {
         lastAssistantSnippet: null,
         lastEventAt: new Date(),
       })?.catch(()=>{});
-      ctx.onEvent?.({
+      emitEvent({
         eventType: 'harness.diagnostic',
         stream: 'stderr',
         level: 'error',
@@ -942,7 +853,7 @@ export async function executeWithHelpers(ctx, helpers) {
       return {exitCode:proc.code===0?1:proc.code??1,signal:proc.signal??null,
       timedOut:proc.timedOut,errorMessage:message,
       clearSession:clearSession || Boolean(canResume && (proc.code !== 0 || proc.final?.status !== 'SUCCESS')),
-      provider:'google',biller:'google',billingType:'metered_api',model:cfg.model,costStatus:'unpriced',
+      provider:'antigravity',biller:'antigravity',billingType:'external_cli_unverified',model:cfg.model,costStatus:'unpriced',
       ...extra,
       resultJson: {
         conversationContinuation: 'continue_conversation_v1',
@@ -953,15 +864,12 @@ export async function executeWithHelpers(ctx, helpers) {
     if(proc.timedOut)return fail(`Antigravity timed out after ${cfg.timeoutSec}s`);
     if(proc.aborted)return fail('Run canceled by Paperclip');
     if(proc.stdoutTruncated || proc.malformed)return fail('Antigravity output exceeded limit or included invalid NDJSON');
+    if(logTruncated)return fail('Paperclip task transcript hit its configured size limit; execution is not fully auditable');
     if(proc.reason)return fail(`Antigravity execution failed: ${proc.reason}`);
     if(permissionFailure || looksLikePermissionDenial(proc.stderr))return fail('Antigravity denied a tool permission; run is not complete');
     if(proc.code!==0) {
       if (classification) {
         let msg = classification.message;
-        if (classification.errorCode === 'provider_quota' && pool?.accounts?.length > 1) {
-          const breakdown = pool.accounts.map(a => `${a.email}: ${a.status === 'quota_exhausted' ? `quota exhausted (resets in ${a.quotaResetAt ? Math.max(0, Math.round((a.quotaResetAt - Date.now()) / 60000)) + 'm' : 'cooldown'})` : a.status}`).join('; ');
-          msg = `All available Antigravity accounts exhausted quota (${breakdown}). Retry scheduled or wait for cooldown.`;
-        }
         return fail(msg, classification.clearSession, {
           errorCode: classification.errorCode,
           errorFamily: classification.errorFamily,
@@ -976,10 +884,6 @@ export async function executeWithHelpers(ctx, helpers) {
     if(proc.final.status!=='SUCCESS'){
       if (classification) {
         let msg = classification.message;
-        if (classification.errorCode === 'provider_quota' && pool?.accounts?.length > 1) {
-          const breakdown = pool.accounts.map(a => `${a.email}: ${a.status === 'quota_exhausted' ? `quota exhausted (resets in ${a.quotaResetAt ? Math.max(0, Math.round((a.quotaResetAt - Date.now()) / 60000)) + 'm' : 'cooldown'})` : a.status}`).join('; ');
-          msg = `All available Antigravity accounts exhausted quota (${breakdown}). Retry scheduled or wait for cooldown.`;
-        }
         return fail(msg, classification.clearSession, {
           errorCode: classification.errorCode,
           errorFamily: classification.errorFamily,
@@ -989,6 +893,9 @@ export async function executeWithHelpers(ctx, helpers) {
       return fail(`Antigravity reported ${proc.final.status}; inspect the corresponding CLI run for details`,lost);
     }
     if(!proc.final.response.trim())return fail('Antigravity reported success with an empty response');
+    const afterAccount=await detectActiveAccount().catch(()=>null);
+    if(currentAccountEmail && afterAccount?.email && currentAccountEmail!==afterAccount.email)
+      return fail('AGY account changed during execution; session must not be reused',true,{errorFamily:'auth'});
     if(cfg.executionMode==='planning' && (await worktreeStatus(cwd)).length) return fail('Planning run modified the worktree; manual inspection required');
 
     let dirtyCount = 0;
@@ -999,7 +906,7 @@ export async function executeWithHelpers(ctx, helpers) {
     } catch {}
 
     if (cfg.executionMode === 'implementation' && dirtyCount > 0) {
-      await ctx.onEvent?.({
+      await emitEvent({
         eventType: 'worktree.dirty_warning',
         stream: 'system',
         level: 'warn',
@@ -1014,22 +921,23 @@ export async function executeWithHelpers(ctx, helpers) {
     }
 
     const id=typeof proc.final.conversation_id==='string' && /^[\w-]{5,200}$/.test(proc.final.conversation_id)?proc.final.conversation_id:null;
-    const next=id?{conversationId:id,cwd,taskKey,workspaceId,usageScope:'cumulative',account:currentAccountEmail}:null;
-    // Calculate estimated USD billing from real usage token counts and model rates so Paperclip tracks ledger costs.
-    const usageObj = usageOf(proc.final);
-    const estimatedCost = estimateCostUsd(cfg.model, usageObj.usage);
-    const hasReportedCost = typeof estimatedCost === 'number';
-
+    // AGY result counters are cumulative for a resumed conversation.
+    const usageObj=usageSince(proc.final.usage,canResume?previous?.usageTotals:null,{isResume:canResume});
+    const next=id?{conversationId:id,cwd,taskKey,workspaceId,model:cfg.model,account:currentAccountEmail,
+      usageScope:'cumulative',usageTotals:usageObj.usageTotals}:null;
+    // Subscription CLI usage is not an authenticated metered API invoice.
+    const hasReportedCost=false;
     await emitAcpx({
       type: 'acpx.result',
       summary: safeText(proc.final.response, 300) || proc.final.status,
-      inputTokens: usageObj.usage?.inputTokens ?? 0,
-      outputTokens: usageObj.usage?.outputTokens ?? 0,
-      cachedTokens: usageObj.usage?.cachedInputTokens ?? 0,
-      costUsd: hasReportedCost ? estimatedCost : undefined,
+      inputTokens: usageObj.usage?.inputTokens,
+      outputTokens: usageObj.usage?.outputTokens,
+      cachedTokens: usageObj.usage?.cachedInputTokens,
+      costUsd: undefined,
       isError: false,
     });
-    await ctx.onEvent?.({
+    await emitAcpx({type:'acpx.status',text:'Dollar cost unavailable: AGY CLI token totals are not billing records'});
+    await emitEvent({
       eventType: 'turn.completed',
       stream: 'system',
       level: 'info',
@@ -1040,7 +948,7 @@ export async function executeWithHelpers(ctx, helpers) {
         usage: usageObj.usage,
       },
     });
-    await ctx.onEvent?.({
+    await emitEvent({
       eventType: 'harness.exited',
       stream: 'system',
       level: 'info',
@@ -1062,14 +970,14 @@ export async function executeWithHelpers(ctx, helpers) {
       exitCode: 0,
       signal: null,
       timedOut: false,
-      provider: 'google',
-      biller: 'google',
-      billingType: 'metered_api',
+      provider: 'antigravity',
+      biller: 'antigravity',
+      billingType: 'external_cli_unverified',
       model: cfg.model,
-      costStatus: hasReportedCost ? 'reported' : 'unpriced',
-      ...(hasReportedCost ? { costUsd: estimatedCost, cacheAdjustedCostUsd: estimatedCost } : {}),
-      ...usageObj,
-      sessionParams: next,
+      costStatus: 'unpriced',
+      usage:usageObj.usage||undefined,
+      usageBasis:usageObj.usageBasis,
+      sessionParams:next,
       sessionDisplayId: id,
       summary: safeText(proc.final.response, 1500),
       resultJson: {

@@ -4,7 +4,7 @@ import { mkdir, writeFile, symlink, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { fixture, fakeContext, helpers } from './fixtures.js';
+import { fixture, fakeContext, helpers ,testDeps} from './fixtures.js';
 import { resolveAssignedWorkspace } from '../src/lib/assigned-workspace.js';
 import { executeWithHelpers } from '../src/server/execute.js';
 import { normalizeConfig } from '../src/lib/config.js';
@@ -29,7 +29,7 @@ test('Paperclip dynamic checkout overrides configured cwd and selects validated 
  const resolved=await resolveAssignedWorkspace(ctx,normalizeConfig(config));
  assert.equal(resolved.cwd,await realpath(f.secondary));
  assert.equal(resolved.workspaceId,'ws-123');
- const result=await executeWithHelpers(ctx,helpers);
+ const result=await executeWithHelpers(ctx, helpers, testDeps);
  assert.equal(result.exitCode,0,JSON.stringify(result));
  assert.equal(result.sessionParams.workspaceId,'ws-123');
  assert.equal(result.sessionParams.cwd,await realpath(f.secondary));
@@ -43,12 +43,12 @@ test('canonicalizes symlinked worktree paths and safely resumes the same issue',
  ctx.context.paperclipWorkspace.cwd=alias;
  const resolved=await resolveAssignedWorkspace(ctx,normalizeConfig(ctx.config));
  assert.equal(resolved.cwd,await realpath(f.secondary));
- const first=await executeWithHelpers(ctx,helpers);
+ const first=await executeWithHelpers(ctx, helpers, testDeps);
  assert.equal(first.exitCode,0,JSON.stringify(first));
  assert.equal(first.sessionParams.cwd,resolved.cwd);
  ctx.runtime.sessionParams=first.sessionParams;
  ctx.context.paperclipWorkspace.cwd=f.secondary;
- const second=await executeWithHelpers(ctx,helpers);
+ const second=await executeWithHelpers(ctx, helpers, testDeps);
  assert.equal(second.exitCode,0,JSON.stringify(second));
 });
 
@@ -56,20 +56,20 @@ test('dynamic checkout ignores configured primary cwd and uses Paperclip source 
  const {f,ctx}=await dynamicSetup(t);
  const old=ctx.config.cwd;
  assert.equal(old,f.primary);
- const result=await executeWithHelpers(ctx,helpers);
+ const result=await executeWithHelpers(ctx, helpers, testDeps);
  assert.equal(result.exitCode,0,JSON.stringify(result));
 });
 
 test('Paperclip dynamic mode fails closed without task workspace and without marker',async t=>{
  const {f,ctx,spawned}=await dynamicSetup(t);
  delete ctx.context.paperclipWorkspace;
- let result=await executeWithHelpers(ctx,helpers);
+ let result=await executeWithHelpers(ctx, helpers, testDeps);
  assert.notEqual(result.exitCode,0);
  assert.match(result.errorMessage,/did not supply an execution workspace/i);
  assert.equal(spawned.length,0);
  ctx.context.paperclipWorkspace={cwd:f.secondary,workspaceId:'ws-123'};
  await writeFile(path.join(f.root,'.paperclip-antigravity-allow'),'not authorized');
- result=await executeWithHelpers(ctx,helpers);
+ result=await executeWithHelpers(ctx, helpers, testDeps);
  assert.match(result.errorMessage,/marker/);
  assert.equal(spawned.length,0);
 });
@@ -77,17 +77,17 @@ test('Paperclip dynamic mode fails closed without task workspace and without mar
 test('rejects primary checkout, unrelated repo, and unregistered secondary paths',async t=>{
  const {f,ctx,config,spawned}=await dynamicSetup(t);
  ctx.context.paperclipWorkspace.cwd=f.primary;
- let result=await executeWithHelpers(ctx,helpers);
+ let result=await executeWithHelpers(ctx, helpers, testDeps);
  assert.match(result.errorMessage,/primary checkout/);
  const stranger=path.join(f.root,'stranger');
  await exec('git',['init','-q','-b','pilot/stranger',stranger]);
  ctx.context.paperclipWorkspace.cwd=stranger;
- result=await executeWithHelpers(ctx,helpers);
+ result=await executeWithHelpers(ctx, helpers, testDeps);
  assert.match(result.errorMessage,/different Git repository/);
  const unregistered=path.join(f.root,'unregistered');
  await mkdir(unregistered);
  ctx.context.paperclipWorkspace.cwd=unregistered;
- result=await executeWithHelpers(ctx,helpers);
+ result=await executeWithHelpers(ctx, helpers, testDeps);
  assert.notEqual(result.exitCode,0);
  assert.equal(spawned.length,0);
 });
@@ -98,44 +98,44 @@ test('rejects symlink escape and primary repo misconfiguration',async t=>{
  const alias=path.join(f.secondary,'link-out');
  await symlink(outside,alias,'dir');
  ctx.context.paperclipWorkspace.cwd=alias;
- const result=await executeWithHelpers(ctx,helpers);
+ const result=await executeWithHelpers(ctx, helpers, testDeps);
  assert.notEqual(result.exitCode,0);
  ctx.context.paperclipWorkspace.cwd=f.secondary;
  config.repositoryRoot=outside;
- assert.notEqual((await executeWithHelpers(ctx,helpers)).exitCode,0);
+ assert.notEqual((await executeWithHelpers(ctx, helpers, testDeps)).exitCode,0);
 });
 
 test('task & workspace session isolation survives cross-worktree changes',async t=>{
  const {f,ctx,config}=await dynamicSetup(t);
- const first=await executeWithHelpers(ctx,helpers);
+ const first=await executeWithHelpers(ctx, helpers, testDeps);
  assert.equal(first.exitCode,0,JSON.stringify(first));
  const session=first.sessionParams;
  assert.equal(sessionCodec.deserialize(session).workspaceId,'ws-123');
  ctx.runtime.sessionParams={...session,workspaceId:'different-id'};
- let res=await executeWithHelpers(ctx,helpers);
+ let res=await executeWithHelpers(ctx, helpers, testDeps);
  assert.match(res.errorMessage,/another workspace or task/);
  ctx.runtime.sessionParams={...session,taskKey:'other-task'};
- res=await executeWithHelpers(ctx,helpers);
+ res=await executeWithHelpers(ctx, helpers, testDeps);
  assert.match(res.errorMessage,/another workspace or task/);
  ctx.runtime.sessionParams={...session};
  const second=path.join(f.root,'second-task');
  await exec('git',['-C',f.primary,'worktree','add','-q','-b','pilot/second',second]);
  ctx.context.paperclipWorkspace={cwd:second,workspaceId:'ws-456'};
- res=await executeWithHelpers(ctx,helpers);
+ res=await executeWithHelpers(ctx, helpers, testDeps);
  assert.match(res.errorMessage,/another workspace or task/);
 });
 
 test('implementation requires workspace ID and explicit authorization',async t=>{
  const {f,ctx,config,spawned}=await dynamicSetup(t,{mode:'implementation'});
  delete ctx.context.paperclipWorkspace.workspaceId;
- let result=await executeWithHelpers(ctx,helpers);
+ let result=await executeWithHelpers(ctx, helpers, testDeps);
  assert.match(result.errorMessage,/workspace ID/);
  ctx.context.paperclipWorkspace.workspaceId='ws-123';
  config.enableImplementation=false;
- result=await executeWithHelpers(ctx,helpers);
+ result=await executeWithHelpers(ctx, helpers, testDeps);
  assert.match(result.errorMessage,/enableImplementation/);
  config.enableImplementation=true;
- result=await executeWithHelpers(ctx,helpers);
+ result=await executeWithHelpers(ctx, helpers, testDeps);
  assert.equal(result.exitCode,0,JSON.stringify(result));
 });
 
@@ -143,13 +143,13 @@ test('planning uses native agy plan mode; implementation is never accept-edits o
  const {ctx}=await dynamicSetup(t);
  let args;
  ctx.onMeta=async m=>{args=m.commandArgs;};
- const result=await executeWithHelpers(ctx,helpers);
+ const result=await executeWithHelpers(ctx, helpers, testDeps);
  assert.equal(result.exitCode,0,JSON.stringify(result));
  assert.ok(args.includes('--mode=plan'));
  assert.ok(!args.includes('--dangerously-skip-permissions'));
  ctx.config={...ctx.config,executionMode:'implementation',enableImplementation:true,approvedIssueIds:['task-123']};
  ctx.onMeta=async m=>{args=m.commandArgs;};
- const implement=await executeWithHelpers(ctx,helpers);
+ const implement=await executeWithHelpers(ctx, helpers, testDeps);
  assert.equal(implement.exitCode,0,JSON.stringify(implement));
  assert.ok(args.includes('--mode=default'));
  assert.ok(!args.includes('--mode=accept-edits'));
@@ -158,7 +158,7 @@ test('planning uses native agy plan mode; implementation is never accept-edits o
 test('rejects remote execution targets even with valid checkout',async t=>{
  const {ctx,spawned}=await dynamicSetup(t);
  ctx.executionTarget={kind:'ssh'};
- const result=await executeWithHelpers(ctx,helpers);
+ const result=await executeWithHelpers(ctx, helpers, testDeps);
  assert.match(result.errorMessage,/Only local execution/);
  assert.equal(spawned.length,0);
 });
@@ -173,7 +173,7 @@ test('environment test allows pending workspace during agent configuration, neve
 test('implementation refuses unapproved issue and never spawns agy', async t=>{
  const {ctx,spawned}=await dynamicSetup(t,{mode:'implementation'});
  ctx.config.approvedIssueIds=['some-other-issue'];
- const r=await executeWithHelpers(ctx,helpers);
+ const r=await executeWithHelpers(ctx, helpers, testDeps);
  assert.match(r.errorMessage,/no explicit issue or isolated project implementation authorization/);
  assert.equal(spawned.length,0);
 });
@@ -186,7 +186,7 @@ test('unassigned heartbeat wake in Paperclip mode returns clean idle status with
  delete ctx.context.taskId;
  delete ctx.context.issueId;
  ctx.context.paperclipWorkspace={cwd:path.join(f.root,'agent-home'),source:'agent_home',strategy:'project_primary'};
- const result=await executeWithHelpers(ctx,helpers);
+ const result=await executeWithHelpers(ctx, helpers, testDeps);
  assert.equal(result.exitCode,0,JSON.stringify(result));
  assert.equal(result.resultJson.status,'SUCCESS');
  assert.match(result.summary,/heartbeat completed/i);
@@ -195,7 +195,7 @@ test('unassigned heartbeat wake in Paperclip mode returns clean idle status with
 
 test('task switch with forceFreshSession starts fresh session instead of failing', async t=>{
  const {f,ctx,spawned}=await dynamicSetup(t);
- const first=await executeWithHelpers(ctx,helpers);
+ const first=await executeWithHelpers(ctx, helpers, testDeps);
  assert.equal(first.exitCode,0);
  assert.equal(first.sessionParams.taskKey,'task-123');
  // Now Paperclip assigns a new task with forceFreshSession
@@ -203,7 +203,7 @@ test('task switch with forceFreshSession starts fresh session instead of failing
  ctx.context.taskId='task-456';
  ctx.context.forceFreshSession=true;
  ctx.runtime.sessionParams=first.sessionParams;
- const second=await executeWithHelpers(ctx,helpers);
+ const second=await executeWithHelpers(ctx, helpers, testDeps);
  assert.equal(second.exitCode,0,JSON.stringify(second));
  assert.equal(second.sessionParams.taskKey,'task-456');
  assert.equal(spawned.length,2);

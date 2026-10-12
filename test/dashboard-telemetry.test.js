@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { executeWithHelpers, extractToolTarget, formatToolProgress } from '../src/server/execute.js';
-import { fixture, helpers } from './fixtures.js';
+import { fixture, helpers ,testDeps} from './fixtures.js';
 import { chmod, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -162,6 +162,7 @@ process.stdin.on('end', () => {
       allowedWorkspaceRoot: f.secondary,
       executionMode: 'planning',
       model: 'gemini-3.8-flash-high',
+      validateSelectedModelOnRun: false,
       timeoutSec: 30,
     },
     context: { taskId: 'task-telem', taskTitle: 'Telemetry test' },
@@ -172,7 +173,7 @@ process.stdin.on('end', () => {
     onSpawn: async () => {},
   };
 
-  const res = await executeWithHelpers(ctx, helpers);
+  const res = await executeWithHelpers(ctx, helpers, testDeps);
   assert.equal(res.exitCode, 0);
 
   // 1. Verify onRuntimeProgress captures stages and currentToolName

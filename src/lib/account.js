@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { readObservedStatus } from './statusline.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -51,9 +52,12 @@ export function parseKeyringPayload(raw) {
  * Injectable runner for unit tests.
  */
 export async function detectActiveAccount(runner = execFileAsync, platform = process.platform) {
+  // The TUI statusline is a fresh observation, not a credential authority.
+  const observed = await readObservedStatus().catch(() => null);
+  if (observed?.email) return {email:observed.email,name:null,authMethod:'cli',source:'agy_statusline',observedAt:observed.observedAt,model:observed.model};
   if (process.env.NODE_ENV === 'test' && !process.env.PAPERCLIP_ANTIGRAVITY_LIVE_KEYCHAIN) {
     if (process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD) {
-      return parseKeyringPayload(process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD);
+      return {...parseKeyringPayload(process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD),source:'keychain'};
     }
     return null;
   }
@@ -70,7 +74,7 @@ export async function detectActiveAccount(runner = execFileAsync, platform = pro
         windowsHide: true,
       });
       const parsed = parseKeyringPayload(stdout);
-      if (parsed) return parsed;
+      if (parsed) return {...parsed,source:'keychain'};
     } catch {
       // Keyring query failed or item not found
     }
@@ -78,31 +82,14 @@ export async function detectActiveAccount(runner = execFileAsync, platform = pro
   return null;
 }
 
-/**
- * Resolves an alternative cross-provider model pool when a quota limit (429) is hit.
- * Antigravity maintains segregated quota pools:
- * - Google pool: gemini-*
- * - Anthropic pool: claude-*
- * - GPT pool: gpt-oss-*
- */
-export function resolveQuotaFallbackModel(currentModel, availableModels = []) {
-  if (typeof currentModel !== 'string' || !currentModel.trim()) return null;
-  const cur = currentModel.trim();
-  const list = Array.isArray(availableModels) && availableModels.length > 0 ? availableModels : null;
-
-  let candidates = [];
-  if (cur.startsWith('gemini-')) {
-    candidates = ['claude-sonnet-4-6', 'claude-opus-4-6-thinking', 'gpt-oss-120b-medium'];
-  } else if (cur.startsWith('claude-')) {
-    candidates = ['gemini-3.8-flash-high', 'gpt-oss-120b-medium', 'gemini-3.1-pro-high'];
-  } else {
-    candidates = ['claude-sonnet-4-6', 'gemini-3.8-flash-high'];
-  }
-
-  for (const cand of candidates) {
-    if (cand === cur) continue;
-    if (!list || list.includes(cand)) return cand;
-  }
-
-  return null;
+/** Optional macOS keychain observation. Never returns raw credentials. */
+export async function detectHeadlessKeychainAccount(runner=execFileAsync,platform=process.platform) {
+  if(process.env.NODE_ENV==='test' && !process.env.PAPERCLIP_ANTIGRAVITY_LIVE_KEYCHAIN)
+    return process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD ? parseKeyringPayload(process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD) : null;
+  if(platform!=='darwin')return null;
+  try {
+    const {stdout}=await runner('security',['find-generic-password','-s','gemini','-a','antigravity','-w'],
+      {timeout:3000,encoding:'utf8',windowsHide:true});
+    return parseKeyringPayload(stdout);
+  }catch{return null;}
 }

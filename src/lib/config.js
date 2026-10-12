@@ -62,7 +62,9 @@ export function normalizeConfig(raw = {}) {
     command, cwd, allowedWorkspaceRoot: root, repositoryRoot, workspaceMode, executionMode: mode,
     enableImplementation: raw.enableImplementation === true,
     sandbox: true, model, effort, cliAgent,
-    enableAccountRotation: raw.enableAccountRotation !== false,
+    // AGY owns authentication; never auto-rotate credentials to work around quotas.
+    enableAccountRotation: false,
+    validateSelectedModelOnRun: raw.validateSelectedModelOnRun !== false,
     accountPoolFile: accountPoolFile || null,
     timeoutSec: int(raw.timeoutSec, 300, 30, 3600),
     probeAuthentication: raw.probeAuthentication !== false,
@@ -76,6 +78,7 @@ export function normalizeConfig(raw = {}) {
 }
 export const configSchema = {
   fields: [
+    { key: 'model', label: 'Antigravity model', type: 'combobox', required: true, options: [], hint: 'Choose a live model returned by Refresh models (agy models); model IDs are not hard-coded' },
     { key: 'command', label: 'Antigravity executable', type: 'text', default: 'agy', hint: 'Absolute path recommended (e.g. /Users/…/.local/bin/agy)' },
     { key: 'workspaceMode', label: 'Workspace mode', type: 'select', default: 'fixed', options: [{label:'Paperclip isolated issue workspace',value:'paperclip'}, {label:'Legacy fixed worktree',value:'fixed'}] },
     { key: 'cwd', label: 'Legacy fixed worktree (not used in Paperclip mode)', type: 'text' },
@@ -91,8 +94,8 @@ export const configSchema = {
     { key: 'effort', label: 'Reasoning effort', type: 'select', options: [{label:'CLI default',value:''},{label:'Low',value:'low'},{label:'Medium',value:'medium'},{label:'High',value:'high'}] },
     { key: 'timeoutSec', label: 'Timeout (seconds)', type: 'number', default: 300 },
     { key: 'graceSec', label: 'Cancellation grace (seconds)', type: 'number', default: 10 },
-    { key: 'enableAccountRotation', label: 'Multiple account auto-rotation on quota exhaustion', type: 'toggle', default: true, hint: 'Auto-switches to next ready Google account when quota limit (429) is hit' },
-    { key: 'accountPoolFile', label: 'Custom account pool JSON path (optional)', type: 'text', hint: 'Defaults to ~/.paperclip/antigravity-accounts.json' },
+    { key: 'validateSelectedModelOnRun', label: 'Validate model against live AGY models before execution', type: 'toggle', default: true },
+    { key: 'accountPoolFile', label: 'Observed account state file (optional)', type: 'text', hint: 'Does not store or switch credentials' },
     { key: 'promptTemplate', label: 'Paperclip prompt template (optional)', type: 'textarea', hint: 'Uses Paperclip placeholders like {{agent.name}}, {{context.taskTitle}}' },
   ],
 };

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile, writeFile, realpath, symlink} from 'node:fs/promises';
 import path from 'node:path';
-import {fixture,fakeContext,helpers,makeMockToken} from './fixtures.js';
+import {fixture,fakeContext,helpers,makeMockToken,testDeps} from './fixtures.js';
 import {executeWithHelpers, formatToolProgress} from '../src/server/execute.js';
 import {normalizeConfig} from '../src/lib/config.js';
 import {sessionCodec} from '../src/lib/result.js';
@@ -25,15 +25,15 @@ test('reject unsafe config and unsupported command injection',()=>{
 });
 test('successful response records real session and usage; hides token from logs',async(t)=>{
  const f=await fixture(t);const {ctx,logs,spawned}=fakeContext(f.config);
- const r=await executeWithHelpers(ctx,helpers);
+ const r=await executeWithHelpers(ctx, helpers, testDeps);
  assert.equal(r.exitCode,0,JSON.stringify(r));
  assert.equal(r.sessionParams.conversationId,'abcde-123');
  assert.equal(r.usage.inputTokens,123);
- assert.equal(r.usageBasis,'session_cumulative');
- assert.equal(r.costStatus,'reported');
- assert.equal(typeof r.costUsd,'number');
- assert.equal(r.billingType,'metered_api');
- assert.equal(r.biller,'google');
+ assert.equal(r.usageBasis,'turn_delta');
+ assert.equal(r.costStatus,'unpriced');
+ assert.equal(r.costUsd,undefined);
+ assert.equal(r.billingType,'external_cli_unverified');
+ assert.equal(r.biller,'antigravity');
  assert.ok(logs.some(x=>x[1].includes('done')));
  assert.ok(logs.some(x=>x[1].includes('"acpx.text_delta"')));
  assert.ok(!JSON.stringify(logs).includes('test-token'));
@@ -46,29 +46,29 @@ test('resumes known conversation only within same workspace and task',async(t)=>
  const alias=path.join(f.root,'alias-to-pilot');
  await symlink(f.secondary,alias,'dir');
  ctx.runtime.sessionParams={conversationId:'abcde-123',cwd:alias,taskKey:'task-123'};
- const resumed=await executeWithHelpers(ctx,helpers);
+ const resumed=await executeWithHelpers(ctx, helpers, testDeps);
  assert.equal(resumed.exitCode,0,JSON.stringify(resumed));
  assert.equal(resumed.sessionParams.cwd,await realpath(f.secondary));
  ctx.runtime.sessionParams={conversationId:'abcde-123',cwd:f.primary,taskKey:'task-123'};
- const r=await executeWithHelpers(ctx,helpers);
+ const r=await executeWithHelpers(ctx, helpers, testDeps);
  assert.notEqual(r.exitCode,0);
  assert.match(r.errorMessage,/another workspace/);
  ctx.runtime.sessionParams={conversationId:'abcde-123',cwd:alias,taskKey:'another-task'};
- const wrongTask=await executeWithHelpers(ctx,helpers);
+ const wrongTask=await executeWithHelpers(ctx, helpers, testDeps);
  assert.notEqual(wrongTask.exitCode,0);
  assert.match(wrongTask.errorMessage,/another workspace or task/);
 });
 test('fails closed for CLI ERROR, malformed output, missing final result and permission denial',async(t)=>{
  const f=await fixture(t);
  for(const label of ['SCENARIO_ERROR','SCENARIO_MALFORMED','SCENARIO_NO_RESULT','SCENARIO_SOFT_DENY','SCENARIO_AUTO_APPROVE']){
-  const {ctx}=fakeContext(f.config,label); const r=await executeWithHelpers(ctx,helpers);
+  const {ctx}=fakeContext(f.config,label); const r=await executeWithHelpers(ctx, helpers, testDeps);
   assert.notEqual(r.exitCode,0,`${label}: ${JSON.stringify(r)}`);
  }
 });
 test('quota / token limit failure classifies provider_quota and clears session', async(t)=>{
  const f=await fixture(t);
  const {ctx}=fakeContext(f.config,'SCENARIO_QUOTA');
- const r=await executeWithHelpers(ctx,helpers);
+ const r=await executeWithHelpers(ctx, helpers, testDeps);
  assert.notEqual(r.exitCode,0);
  assert.equal(r.errorCode,'provider_quota');
  assert.equal(r.resultJson?.errorFamily,'provider_quota');
@@ -78,7 +78,7 @@ test('quota / token limit failure classifies provider_quota and clears session',
 test('auth failure classifies provider_auth_error and clears session', async(t)=>{
  const f=await fixture(t);
  const {ctx}=fakeContext(f.config,'SCENARIO_AUTH_FAIL');
- const r=await executeWithHelpers(ctx,helpers);
+ const r=await executeWithHelpers(ctx, helpers, testDeps);
  assert.notEqual(r.exitCode,0);
  assert.equal(r.errorCode,'provider_auth_error');
  assert.equal(r.resultJson?.errorFamily,'auth');
@@ -88,7 +88,7 @@ test('auth failure classifies provider_auth_error and clears session', async(t)=
 test('turn limit hit classifies agent_turn_limit_reached and retains session', async(t)=>{
  const f=await fixture(t);
  const {ctx}=fakeContext(f.config,'SCENARIO_TURN_LIMIT');
- const r=await executeWithHelpers(ctx,helpers);
+ const r=await executeWithHelpers(ctx, helpers, testDeps);
  assert.equal(r.exitCode,53);
  assert.equal(r.errorCode,'agent_turn_limit_reached');
  assert.equal(r.resultJson?.errorFamily,'execution');
@@ -98,7 +98,7 @@ test('turn limit hit classifies agent_turn_limit_reached and retains session', a
 test('unclassified error includes first line of stderr in error message', async(t)=>{
  const f=await fixture(t);
  const {ctx}=fakeContext(f.config,'SCENARIO_UNCLASSIFIED');
- const r=await executeWithHelpers(ctx,helpers);
+ const r=await executeWithHelpers(ctx, helpers, testDeps);
  assert.notEqual(r.exitCode,0);
  assert.match(r.errorMessage,/fatal: custom execution error occurred/);
 });
@@ -106,26 +106,26 @@ test('failure during conversation resume automatically clears session', async(t)
  const f=await fixture(t);
  const {ctx}=fakeContext(f.config,'SCENARIO_FAIL_RESUME');
  ctx.runtime.sessionParams={conversationId:'abcde-123',cwd:f.secondary,taskKey:'task-123'};
- const r=await executeWithHelpers(ctx,helpers);
+ const r=await executeWithHelpers(ctx, helpers, testDeps);
  assert.notEqual(r.exitCode,0);
  assert.equal(r.clearSession,true);
 });
 test('planning detects unexpected file creation',async(t)=>{
  const f=await fixture(t);const {ctx}=fakeContext(f.config,'SCENARIO_WRITE');
- const result=await executeWithHelpers(ctx,helpers);
+ const result=await executeWithHelpers(ctx, helpers, testDeps);
  assert.notEqual(result.exitCode,0);
  assert.match(result.errorMessage,/modified the worktree/);
 });
 test('planning fails before CLI spawn on dirty tree',async(t)=>{
  const f=await fixture(t);await writeFile(path.join(f.secondary,'dirty.txt'),'dirty');
- const {ctx,spawned}=fakeContext(f.config);const r=await executeWithHelpers(ctx,helpers);
+ const {ctx,spawned}=fakeContext(f.config);const r=await executeWithHelpers(ctx, helpers, testDeps);
  assert.notEqual(r.exitCode,0);assert.equal(spawned.length,0);
 });
 test('cancels child process and returns failure',async(t)=>{
  const f=await fixture(t);const {ctx}=fakeContext(f.config,'SCENARIO_HANG');
  const ac=new AbortController();ctx.signal=ac.signal;
  setTimeout(()=>ac.abort(),350);
- const r=await executeWithHelpers(ctx,helpers);
+ const r=await executeWithHelpers(ctx, helpers, testDeps);
  assert.notEqual(r.exitCode,0);
  assert.match(r.errorMessage,/canceled/i);
 });
@@ -204,125 +204,48 @@ test('formatToolProgress formats active tool and done states with bounded safe o
  assert.match(fileEdit,/\[tool:replace_file_content\] \/path\/to\/file\.ts/);
 });
 
-test('estimateCostUsd calculates accurate token pricing across model tiers', () => {
-  // Flash pricing: $0.10 / 1M in, $0.025 / 1M cached, $0.40 / 1M out
-  const flashUsage = { inputTokens: 1_000_000, cachedInputTokens: 2_000_000, outputTokens: 500_000 };
-  const flashCost = estimateCostUsd('gemini-3.8-flash-high', flashUsage);
-  // 1.0 * 0.10 + 2.0 * 0.025 + 0.5 * 0.40 = 0.10 + 0.05 + 0.20 = 0.35
-  assert.equal(flashCost, 0.35);
-
-  // Pro pricing: $1.25 / 1M in, $0.3125 / 1M cached, $5.00 / 1M out
-  const proUsage = { inputTokens: 200_000, cachedInputTokens: 3_800_000, outputTokens: 50_000 };
-  const proCost = estimateCostUsd('gemini-3.1-pro-low', proUsage);
-  // (200000 * 1.25 + 3800000 * 0.3125 + 50000 * 5.0) / 1e6 = 1.6875
-  assert.equal(proCost, 1.6875);
-
-  // Claude Sonnet: $3.00 / 1M in, $0.30 / 1M cached, $15.00 / 1M out
-  const sonnetCost = estimateCostUsd('claude-3-5-sonnet', { inputTokens: 1_000_000, outputTokens: 100_000 });
-  // 1.0 * 3.00 + 0.1 * 15.00 = 3.00 + 1.50 = 4.50
-  assert.equal(sonnetCost, 4.5);
-
-  // Edge cases: zero tokens, missing usage, snake_case keys
-  assert.equal(estimateCostUsd('gemini-3.8-flash-high', { inputTokens: 0, outputTokens: 0 }), 0);
-  assert.equal(estimateCostUsd('gemini-3.8-flash-high', null), null);
-  assert.equal(estimateCostUsd('gemini-3.8-flash-high', { input_tokens: 1_000_000 }), 0.10);
+test('pricing calculator uses explicit provider usage and precise catalog rates, never model-family defaults', async () => {
+ const catalog={models:{'gemini/gemini-3.8-flash-high':{
+   litellm_provider:'gemini',mode:'chat',input_cost_per_token:'0.000001',
+   cache_read_input_token_cost:'0.00000025',output_cost_per_token:'0.000004'}}};
+ const cost=await estimateCostUsd({provider:'gemini',model:'gemini-3.8-flash-high',
+   response:{usageMetadata:{promptTokenCount:3000000,cachedContentTokenCount:2000000,
+     candidatesTokenCount:500000}},pricingCatalog:catalog});
+ assert.equal(cost.costUsdExact,'3.5');
+ await assert.rejects(estimateCostUsd({provider:'gemini',model:'unsupported-model',
+   response:{usageMetadata:{promptTokenCount:1,candidatesTokenCount:1}},pricingCatalog:catalog}),
+   /No exact/);
 });
 
-test('auto-rotates to next ready account on quota exhaustion (429) and retries turn with original model', async (t) => {
-  const f = await fixture(t);
-  const acc1 = 'account1@example.com';
-  const acc2 = 'account2@example.com';
-  const token1 = makeMockToken(acc1);
-  const token2 = makeMockToken(acc2);
-
-  const pool = {
-    version: 1,
-    activeAccount: acc1,
-    accounts: [
-      { email: acc1, tokenPayload: token1, status: 'ready', expiry: '2099-01-01T00:00:00Z', quotaResetAt: null, lastUsedAt: null },
-      { email: acc2, tokenPayload: token2, status: 'ready', expiry: '2099-01-01T00:00:00Z', quotaResetAt: null, lastUsedAt: null },
-    ],
-  };
-  await writeFile(f.mockPoolFile, JSON.stringify(pool, null, 2));
-  process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD = token1;
-
-  const events = [];
-  const { ctx, spawned } = fakeContext(f.config, 'SCENARIO_QUOTA_ONCE');
-  ctx.onEvent = async (e) => events.push(e);
-
-  const res = await executeWithHelpers(ctx, helpers);
-  assert.equal(res.exitCode, 0, JSON.stringify(res));
-  assert.equal(res.sessionParams.account, acc2);
-  assert.equal(res.model, 'gemini-3.8-flash-low');
-  assert.equal(spawned.length, 2);
-
-  const autoSwitchEvt = events.find(e => e.eventType === 'account.auto_switched');
-  assert.ok(autoSwitchEvt, 'account.auto_switched event must be emitted');
-  assert.equal(autoSwitchEvt.payload.previousAccount, acc1);
-  assert.equal(autoSwitchEvt.payload.currentAccount, acc2);
-  assert.equal(autoSwitchEvt.payload.model, 'gemini-3.8-flash-low');
-  assert.equal(process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD, token2);
+test('quota error does not silently rotate an AGY account or replay a side-effectful turn',async(t)=>{
+ const f=await fixture(t);const email='current@example.com';
+ const token=makeMockToken(email);
+ process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD=token;
+ const {ctx,spawned}=fakeContext(f.config,'SCENARIO_QUOTA');
+ const result=await executeWithHelpers(ctx, helpers, testDeps);
+ assert.equal(result.errorCode,'provider_quota');
+ assert.equal(spawned.length,1);
+ assert.equal(process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD,token);
 });
 
-test('pre-turn auto-switches to ready account if active account is on quota cooldown', async (t) => {
-  const f = await fixture(t);
-  const acc1 = 'account1@example.com';
-  const acc2 = 'account2@example.com';
-  const token1 = makeMockToken(acc1);
-  const token2 = makeMockToken(acc2);
-
-  const pool = {
-    version: 1,
-    activeAccount: acc1,
-    accounts: [
-      { email: acc1, tokenPayload: token1, status: 'quota_exhausted', expiry: '2099-01-01T00:00:00Z', quotaResetAt: Date.now() + 1800000, lastUsedAt: null },
-      { email: acc2, tokenPayload: token2, status: 'ready', expiry: '2099-01-01T00:00:00Z', quotaResetAt: null, lastUsedAt: null },
-    ],
-  };
-  await writeFile(f.mockPoolFile, JSON.stringify(pool, null, 2));
-  process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD = token1;
-
-  const events = [];
-  const { ctx, spawned } = fakeContext(f.config, 'SCENARIO_OK');
-  ctx.onEvent = async (e) => events.push(e);
-
-  const res = await executeWithHelpers(ctx, helpers);
-  assert.equal(res.exitCode, 0, JSON.stringify(res));
-  assert.equal(res.sessionParams.account, acc2);
-  assert.equal(spawned.length, 1);
-
-  const autoSwitchEvt = events.find(e => e.eventType === 'account.auto_switched');
-  assert.ok(autoSwitchEvt, 'account.auto_switched event must be emitted before dispatch');
-  assert.equal(autoSwitchEvt.payload.previousAccount, acc1);
-  assert.equal(autoSwitchEvt.payload.currentAccount, acc2);
-  assert.equal(process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD, token2);
+test('account observation never auto-switches to a different account despite a previous cooldown',async(t)=>{
+ const f=await fixture(t);const email='current@example.com';
+ const token=makeMockToken(email);
+ process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD=token;
+ const {ctx,spawned}=fakeContext(f.config);
+ const result=await executeWithHelpers(ctx, helpers, testDeps);
+ assert.equal(result.exitCode,0);
+ assert.equal(result.sessionParams.account,email);
+ assert.equal(spawned.length,1);
+ assert.equal(process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD,token);
 });
 
-test('fails with provider_quota when all accounts in pool are exhausted', async (t) => {
-  const f = await fixture(t);
-  const acc1 = 'account1@example.com';
-  const acc2 = 'account2@example.com';
-  const token1 = makeMockToken(acc1);
-  const token2 = makeMockToken(acc2);
-
-  const pool = {
-    version: 1,
-    activeAccount: acc1,
-    accounts: [
-      { email: acc1, tokenPayload: token1, status: 'ready', expiry: '2099-01-01T00:00:00Z', quotaResetAt: null, lastUsedAt: null },
-      { email: acc2, tokenPayload: token2, status: 'ready', expiry: '2099-01-01T00:00:00Z', quotaResetAt: null, lastUsedAt: null },
-    ],
-  };
-  await writeFile(f.mockPoolFile, JSON.stringify(pool, null, 2));
-  process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD = token1;
-
-  const { ctx, spawned } = fakeContext(f.config, 'SCENARIO_QUOTA');
-  const res = await executeWithHelpers(ctx, helpers);
-
-  assert.notEqual(res.exitCode, 0);
-  assert.equal(res.errorCode, 'provider_quota');
-  assert.match(res.errorMessage, /all available antigravity accounts exhausted quota/i);
-  assert.equal(spawned.length, 2);
+test('one quota error is accurately classified without claiming that all accounts have failed',async(t)=>{
+ const f=await fixture(t);const {ctx,spawned}=fakeContext(f.config,'SCENARIO_QUOTA');
+ const result=await executeWithHelpers(ctx, helpers, testDeps);
+ assert.equal(result.errorCode,'provider_quota');
+ assert.doesNotMatch(result.errorMessage,/all available/i);
+ assert.equal(spawned.length,1);
 });
 
 test('account pool operations strictly respect custom filePath and do not modify default pool', async (t) => {

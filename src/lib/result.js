@@ -8,15 +8,12 @@ export function validateTerminal(raw) {
   if (id !== undefined && id !== null && (typeof id !== 'string' || id.length > 200)) throw new Error('Invalid conversation ID');
   return raw;
 }
-export function usageOf(result, prior) {
-  const u = isObj(result.usage) ? result.usage : {};
-  const input = Number.isSafeInteger(u.input_tokens) && u.input_tokens >= 0 ? u.input_tokens : 0;
-  const output = Number.isSafeInteger(u.output_tokens) && u.output_tokens >= 0 ? u.output_tokens : 0;
-  const cached = Number.isSafeInteger(u.cache_read_tokens) && u.cache_read_tokens >= 0 ? u.cache_read_tokens : 0;
-  // Antigravity's usage counters may be cumulative across resumed conversations.
-  // Paperclip can calculate deltas from session_cumulative receipts if scoped consistently.
-  return {usage:{inputTokens:input,outputTokens:output,cachedInputTokens:cached}, usageBasis:'session_cumulative'};
+// Backward-compatible utility; calculations are implemented in usage.js.
+import { usageSince } from './usage.js';
+export function usageOf(result, previous) {
+  return usageSince(result?.usage, previous?.usageTotals ?? null, {isResume: Boolean(previous?.conversationId)});
 }
+
 export function errorText(e) {
   if (typeof e === 'string') return e.slice(0,2000);
   if (e instanceof Error) return e.message.slice(0,2000);
@@ -33,12 +30,12 @@ export const sessionCodec = {
   deserialize(value) {
     const id = sessionIdFrom(value);
     if (!id || !isObj(value) || typeof value.cwd !== 'string') return null;
-    return { conversationId:id,cwd:value.cwd,taskKey:typeof value.taskKey==='string'?value.taskKey:'',workspaceId:typeof value.workspaceId==='string'?value.workspaceId:'',usageScope:'cumulative' };
+    return { conversationId:id,cwd:value.cwd,taskKey:typeof value.taskKey==='string'?value.taskKey:'',workspaceId:typeof value.workspaceId==='string'?value.workspaceId:'',model:typeof value.model==='string'?value.model:null,account:typeof value.account==='string'?value.account:null,usageTotals:value.usageTotals && typeof value.usageTotals==='object'?{...value.usageTotals}:null,usageScope:'cumulative' };
   },
   serialize(value) {
     const id = sessionIdFrom(value);
     if (!id || !isObj(value) || typeof value.cwd !== 'string') return null;
-    return { conversationId:id,cwd:value.cwd,taskKey:typeof value.taskKey==='string'?value.taskKey:'',workspaceId:typeof value.workspaceId==='string'?value.workspaceId:'',usageScope:'cumulative' };
+    return { conversationId:id,cwd:value.cwd,taskKey:typeof value.taskKey==='string'?value.taskKey:'',workspaceId:typeof value.workspaceId==='string'?value.workspaceId:'',model:typeof value.model==='string'?value.model:null,account:typeof value.account==='string'?value.account:null,usageTotals:value.usageTotals && typeof value.usageTotals==='object'?{...value.usageTotals}:null,usageScope:'cumulative' };
   },
   getDisplayId(value) { return sessionIdFrom(value); },
 };
