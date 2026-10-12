@@ -1,0 +1,77 @@
+import { spawn } from 'node:child_process';
+import { StringDecoder } from 'node:string_decoder';
+/** Process group cancellation on POSIX; bounded stdout, bounded stderr, bounded NDJSON event size. */
+export async function runAgy({ command, args, cwd, env, prompt, timeoutMs, graceMs, maxBytes, signal, onSpawn, onEvent, onStderr }) {
+  if (signal?.aborted) return {code:null, signal:'ABORT', timedOut:false, aborted:true, stderr:'', final:null, reason:'Aborted before spawn'};
+  return await new Promise((resolve) => {
+    let proc;
+    let stdoutBytes=0, stderr='', partial='', malformed=false, final=null, stdoutTruncated=false;
+    let timeoutId, killId, timedOut=false, aborted=false, closed=false, settled=false, spawnError=null;
+    let pending = Promise.resolve();
+    const decoder = new StringDecoder('utf8');
+    const queue = (fn) => { pending = pending.then(fn).catch(e=>{ spawnError ||= e; requestStop('SIGTERM'); }); };
+    const cleanup = () => {
+      clearTimeout(timeoutId); clearTimeout(killId);
+      signal?.removeEventListener('abort',abort);
+    };
+    const killGroup=(sig)=>{
+      if(!proc?.pid) return;
+      if(process.platform !== 'win32') {
+        try {process.kill(-proc.pid,sig);return;}catch{}
+      }
+      try{proc.kill(sig);}catch{}
+    };
+    const requestStop=(sig)=>{
+      killGroup(sig);
+      if(!killId) killId=setTimeout(()=>killGroup('SIGKILL'),graceMs);
+    };
+    const abort=()=>{aborted=true;requestStop('SIGTERM');};
+    const finish=async(code,sig)=>{
+      if(settled) return; settled=true; cleanup();
+      await pending;
+      resolve({code,signal:sig,timedOut,aborted,stderr,final,malformed,stdoutTruncated,reason:spawnError?.message});
+    };
+    try {
+      proc=spawn(command,args,{cwd,env,stdio:['pipe','pipe','pipe'],shell:false,detached:process.platform!=='win32',windowsHide:true});
+    } catch(e){ resolve({code:null,signal:null,timedOut:false,aborted:false,stderr:'',final:null,reason:e.message});return; }
+    proc.on('error',(err)=>{spawnError=err;});
+    proc.on('spawn',()=>{
+      if(signal?.aborted)abort();
+      queue(async()=>{await onSpawn?.({pid:proc.pid,processGroupId:process.platform==='win32'?null:proc.pid,startedAt:new Date().toISOString()});});
+      const message = JSON.stringify({event:'user',message:{content:prompt}})+'\n';
+      proc.stdin.on('error',()=>{});
+      proc.stdin.end(message);
+    });
+    signal?.addEventListener('abort',abort,{once:true});
+    timeoutId=setTimeout(()=>{timedOut=true;requestStop('SIGTERM');},timeoutMs);
+    const processLine=(line)=>{
+      if(!line.trim())return;
+      try{
+        const evt=JSON.parse(line);
+        if(!evt || typeof evt.event!=='string') {malformed=true;return;}
+        if(evt.event==='result') {
+          if(final!==null) {malformed=true;return;}
+          final=evt.result;
+        }
+        queue(async()=>{ const decision=await onEvent?.(evt); if(decision===false){spawnError ||= new Error('Antigravity runtime permission policy is unsafe');requestStop('SIGTERM');} });
+      } catch { malformed=true; }
+    };
+    proc.stdout.on('data',(buf)=>{
+      stdoutBytes+=buf.length;
+      if(stdoutBytes>maxBytes) {stdoutTruncated=true;requestStop('SIGTERM');return;}
+      partial+=decoder.write(buf);
+      if(partial.length>maxBytes) {stdoutTruncated=true;requestStop('SIGTERM');return;}
+      let ix;while((ix=partial.indexOf('\n'))>=0){const l=partial.slice(0,ix);partial=partial.slice(ix+1);processLine(l);}
+    });
+    proc.stderr.on('data',(buf)=>{
+      const text=buf.toString('utf8');
+      stderr=(stderr+text).slice(-65536);
+      queue(()=>onStderr?.(text));
+    });
+    proc.on('close',(code,sig)=>{
+      partial+=decoder.end();if(partial.trim())processLine(partial);
+      closed=true;
+      void finish(code,sig);
+    });
+  });
+}

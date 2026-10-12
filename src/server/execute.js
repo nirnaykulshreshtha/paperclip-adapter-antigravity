@@ -1,0 +1,879 @@
+import { realpath } from 'node:fs/promises';
+import path from 'node:path';
+import { createHash } from 'node:crypto';
+import { normalizeConfig } from '../lib/config.js';
+import { validateWorkspace, worktreeStatus, checkBranchFreshness, readInstructions } from '../lib/workspace.js';
+import { resolveAssignedWorkspace } from '../lib/assigned-workspace.js';
+import { stageAssignedSkills } from '../lib/skills.js';
+import { runAgy } from '../lib/process.js';
+import { errorText, looksLikePermissionDenial, sessionIdFrom, usageOf, isObj } from '../lib/result.js';
+import { estimateCostUsd } from '../lib/pricing.js';
+
+const safeText=(v,max=5000)=>typeof v==='string'?v.slice(0,max):'';
+const maybeStr=(v)=>typeof v==='string'?v:'';
+
+export function sha256Digest(str) {
+  return 'sha256:' + createHash('sha256').update(str || '').digest('hex');
+}
+
+export function unquote(v) {
+  if (typeof v !== 'string') return v;
+  const t = v.trim();
+  if (t.startsWith('"') && t.endsWith('"') && t.length >= 2) {
+    try { return JSON.parse(t); } catch { return t.slice(1, -1); }
+  }
+  return v;
+}
+
+/** Extracts normalized parameters dictionary from tool event step across diverse CLI serializers. */
+export function extractToolParameters(s) {
+  if (!s || typeof s !== 'object') return {};
+  const raw = s.tool_info?.parameters
+    ?? s.tool_info?.args
+    ?? s.tool_info?.arguments
+    ?? s.tool_info?.input
+    ?? s.parameters
+    ?? s.args
+    ?? s.arguments
+    ?? s.input;
+  if (!raw) return {};
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw);
+      if (typeof parsed === 'object' && parsed !== null) return parsed;
+    } catch {
+      return { raw: unquote(raw) };
+    }
+  }
+  if (typeof raw === 'object' && raw !== null) {
+    const res = Array.isArray(raw) ? [...raw] : { ...raw };
+    for (const [k, v] of Object.entries(res)) {
+      res[k] = unquote(v);
+    }
+    return res;
+  }
+  return {};
+}
+
+/** Extracts tool output content string from tool event step. */
+export function extractToolOutput(s) {
+  if (!s || typeof s !== 'object') return '';
+  const raw = s.tool_info?.output
+    ?? s.tool_info?.result
+    ?? s.tool_info?.response
+    ?? s.output
+    ?? s.result
+    ?? s.content;
+  if (typeof raw === 'string') return raw;
+  if (raw !== undefined && raw !== null) {
+    try { return JSON.stringify(raw, null, 2); } catch { return String(raw); }
+  }
+  if (s.tool_info?.error) {
+    return s.tool_info.error.message || String(s.tool_info.error);
+  }
+  return '';
+}
+
+export function mapToolOperation(toolName) {
+  if (toolName === 'run_command') return 'execute';
+  if (toolName === 'view_file' || toolName === 'read_url_content') return 'read';
+  if (toolName === 'write_to_file' || toolName === 'replace_file_content') return 'edit';
+  if (toolName === 'search_web') return 'search';
+  if (toolName === 'manage_subagents' || toolName === 'manage_task') return 'list';
+  return 'unknown';
+}
+
+export function isReadOnlyTool(toolName) {
+  return ['view_file', 'read_url_content', 'search_web'].includes(toolName);
+}
+
+/** Extracts target description from tool parameters, supporting all Antigravity CLI tools. */
+export function extractToolTarget(toolName, p) {
+  if (!isObj(p)) return '';
+  if (toolName === 'invoke_subagent' && Array.isArray(p.Subagents) && p.Subagents.length > 0) {
+    const subs = p.Subagents.map(sub => {
+      const role = sub.Role || sub.TypeName || 'subagent';
+      const prompt = typeof sub.Prompt === 'string' ? sub.Prompt.trim().replace(/\s+/g, ' ').slice(0, 80) : '';
+      return prompt ? `${role}: "${prompt}"` : role;
+    });
+    return subs.join(', ');
+  }
+  if (toolName === 'invoke_subagent') {
+    const role = p.Role || p.TypeName || 'subagent';
+    const prompt = typeof p.Prompt === 'string' ? p.Prompt.trim().replace(/\s+/g, ' ').slice(0, 100) : '';
+    return prompt ? `${role}: ${prompt}` : role;
+  }
+  if (toolName === 'manage_subagents') {
+    const action = p.Action || 'manage';
+    const ids = Array.isArray(p.ConversationIds) ? ` [${p.ConversationIds.slice(0, 3).join(', ')}]` : '';
+    return `${action}${ids} subagents`;
+  }
+  if (toolName === 'manage_task') {
+    return [p.Action, p.TaskId].filter(Boolean).join(' ') || p.toolSummary || '';
+  }
+  if (toolName === 'schedule') {
+    return p.CronExpression || (p.DurationSeconds ? `${p.DurationSeconds}s` : '') || p.Prompt || '';
+  }
+  if (toolName === 'ask_question') {
+    const qCount = Array.isArray(p.questions) ? `${p.questions.length} questions` : '';
+    return qCount || p.toolSummary || '';
+  }
+  if (toolName === 'define_subagent') {
+    return p.name ? `${p.name}: ${p.description || ''}` : '';
+  }
+  if (typeof p.CommandLine === 'string') return p.CommandLine;
+  if (typeof p.command === 'string') return p.command;
+  if (typeof p.cmd === 'string') return p.cmd;
+  if (typeof p.TargetFile === 'string') {
+    const lines = p.StartLine ? `#L${p.StartLine}${p.EndLine ? `-${p.EndLine}` : ''}` : '';
+    return `${p.TargetFile}${lines}`;
+  }
+  if (typeof p.AbsolutePath === 'string') {
+    const lines = p.StartLine ? `#L${p.StartLine}${p.EndLine ? `-${p.EndLine}` : ''}` : '';
+    return `${p.AbsolutePath}${lines}`;
+  }
+  if (typeof p.path === 'string') return p.path;
+  if (typeof p.file === 'string') return p.file;
+  if (typeof p.query === 'string') return p.query;
+  if (typeof p.Url === 'string') return p.Url;
+  if (typeof p.url === 'string') return p.url;
+  if (typeof p.toolSummary === 'string') return p.toolSummary;
+  if (typeof p.toolAction === 'string') return p.toolAction;
+  if (typeof p.Instruction === 'string') return p.Instruction;
+  return '';
+}
+
+/** Formats real-time tool progress into concise, human-readable terminal lines. */
+export function formatToolProgress(s) {
+  if (!s || s.step_type !== 'tool') return null;
+  const name = s.tool_name || s.tool_info?.name || 'tool';
+  if (s.state === 'ACTIVE') {
+    const p = extractToolParameters(s);
+    const target = extractToolTarget(name, p);
+    const trimmed = target ? ` ${target.trim().replace(/\s+/g, ' ').slice(0, 160)}` : '';
+    return `\n[tool:${name}]${trimmed}\n`;
+  }
+  if (s.state === 'DONE') {
+    const dur = typeof s.duration_seconds === 'number' ? ` (${s.duration_seconds.toFixed(2)}s)` : '';
+    if (s.tool_info?.error) {
+      const errMsg = s.tool_info.error?.message || String(s.tool_info.error);
+      return `[tool:${name} error]${dur} ${errMsg.slice(0, 200)}\n`;
+    }
+    let snippet = '';
+    const rawOut = extractToolOutput(s);
+    if (typeof rawOut === 'string') {
+      const out = rawOut.trim();
+      if (out) {
+        snippet = `  ${out.slice(0, 400).replace(/\r\n/g, '\n').replace(/\n/g, '\n  ')}${out.length > 400 ? '...' : ''}\n`;
+      }
+    }
+    return `${snippet}[tool:${name} done]${dur}\n`;
+  }
+  return null;
+}
+
+/** Build a bounded prompt without duplicating arbitrary private server context. */
+export function buildPrompt(ctx, cfg, instr, helpers, skillIndex = '') {
+  const context = isObj(ctx.context)?ctx.context:{};
+  const templateData={
+    agentId:ctx.agent.id,companyId:ctx.agent.companyId,runId:ctx.runId,
+    agent:{id:ctx.agent.id,name:ctx.agent.name},
+    company:{id:ctx.agent.companyId},
+    run:{id:ctx.runId},context,
+    taskId:context.taskId??context.issueId??'', taskTitle:context.taskTitle??'',
+  };
+  const main = cfg.promptTemplate || helpers.DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE || 'You are agent {{agent.id}} ({{agent.name}}).';
+  const sections=[helpers.renderTemplate(main,templateData)];
+  if(instr) sections.push('## Paperclip-managed agent instructions\n'+instr);
+  if(skillIndex) sections.push(skillIndex);
+  sections.push('## Wake context\n'+[
+    ['Task ID', context.taskId??context.issueId],
+    ['Task title',context.taskTitle],
+    ['Task description',context.taskDescription??context.description],
+    ['Wake reason',context.wakeReason],
+    ['Wake comment',context.wakeCommentBody],
+  ].filter(x=>typeof x[1]==='string' && x[1]).map(x=>`${x[0]}: ${safeText(x[1],20000)}`).join('\n'));
+  sections.push(`## Repository and execution rules\nRead and comply with the repository AGENTS.md and applicable SKILL.md.\nExecution mode: ${cfg.executionMode}. `+
+    (cfg.executionMode==='planning'?'Plan and research only. Do not modify any files, run migrations, push Git changes, or deploy. If a write is needed, ask the human for permission in Paperclip and stop.':'Modify files only in the dedicated worktree; no production access, migrations or deployment without human authorization.')+
+    '\nWhen a tool permission is denied, report it explicitly; do not claim success or work around the policy. Track decisions and blockers in Paperclip, and do not reveal secrets.');
+  const prompt=sections.filter(Boolean).join('\n\n');
+  if(Buffer.byteLength(prompt,'utf8')>cfg.maxPromptBytes)throw new Error('Prompt exceeds maxPromptBytes; shorten task context/instructions');
+  return prompt;
+}
+/** Official helper injection allows deterministic tests without live Paperclip or agy. */
+export async function executeWithHelpers(ctx, helpers) {
+  let spawned=false;
+  let stagedSkills=null;
+  try {
+    if (typeof ctx.authToken !== 'string' || !ctx.authToken.trim()) {
+      throw new Error('Antigravity execution requires a host-issued run-scoped Paperclip API token');
+    }
+    const cfg=normalizeConfig(ctx.config);
+    if (ctx.executionTarget?.kind && ctx.executionTarget.kind !== 'local') throw new Error('Only local execution targets are permitted');
+    const taskKey=maybeStr(ctx.runtime?.taskKey)||maybeStr(ctx.context?.taskKey)||maybeStr(ctx.context?.taskId)||maybeStr(ctx.context?.issueId);
+    const hasAssignedTask=Boolean(taskKey);
+
+    // If Paperclip wakes the agent on a heartbeat or on-demand without an assigned issue/task,
+    // handle it cleanly as an idle heartbeat check instead of crashing on worktree resolution.
+    if (cfg.workspaceMode === 'paperclip' && !hasAssignedTask) {
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        provider: 'google',
+        biller: 'google',
+        billingType: 'metered_api',
+        model: cfg.model,
+        costStatus: 'unpriced',
+        summary: `Agent ${ctx.agent?.name || 'idle'}: heartbeat completed. No active task assigned.`,
+        resultJson: {
+          status: 'SUCCESS',
+          conversationContinuation: 'continue_conversation_v1',
+          response: 'Heartbeat idle check completed; no active task assigned.',
+          conversation_id: null,
+        },
+      };
+    }
+    const workspace = cfg.workspaceMode === 'paperclip'
+      ? await resolveAssignedWorkspace(ctx, cfg)
+      : await validateWorkspace(cfg);
+    const {cwd} = workspace;
+    if (cfg.workspaceMode === 'paperclip' && cfg.executionMode === 'implementation') {
+      const issueId = maybeStr(ctx.context?.issueId) || maybeStr(ctx.context?.taskId);
+      if (!issueId || (!cfg.approvedIssueIds.includes(issueId) && !cfg.approvedProjectIds.includes(workspace.projectId))) {
+        throw new Error('Implementation blocked: current issue has no explicit issue or isolated project implementation authorization');
+      }
+    }
+    if(cfg.executionMode==='planning' && (await worktreeStatus(cwd)).length) {
+      throw new Error('Planning requires a clean worktree (except the opt-in sentinel)');
+    }
+    if (cfg.executionMode === 'implementation') {
+      const behindMain = await checkBranchFreshness(cwd);
+      if (behindMain > 0) {
+        await ctx.onEvent?.({
+          eventType: 'worktree.behind_main',
+          stream: 'system',
+          level: 'warn',
+          message: `Worktree branch '${workspace.branch}' is ${behindMain} commit(s) behind main. Consider merging main to prevent merge drift.`,
+          payload: { behindCount: behindMain, cwd, branch: workspace.branch },
+        });
+      }
+    }
+    const instructions=await readInstructions(cfg.instructionsFilePath);
+    stagedSkills=await stageAssignedSkills(ctx.config);
+    const prompt=buildPrompt(ctx,cfg,instructions,helpers,stagedSkills.index);
+    const workspaceId=maybeStr(workspace.workspaceId);
+    const previous=ctx.runtime?.sessionParams;
+    const oldId=sessionIdFrom(previous);
+    // macOS commonly reports temp paths under /var/folders while realpath()
+    // resolves them to /private/var/folders. Compare canonical directory identities,
+    // not literal path spellings. Reject nonexistent, relative or moved workspaces.
+    let previousCwd = null;
+    if (oldId && typeof previous?.cwd === 'string' && path.isAbsolute(previous.cwd)) {
+      previousCwd = await realpath(previous.cwd).catch(() => null);
+    }
+    const forceFresh = Boolean(ctx.context?.forceFreshSession);
+    const canResume = Boolean(!forceFresh && oldId && previousCwd === cwd &&
+      (!previous.taskKey || previous.taskKey === taskKey) &&
+      (!previous.workspaceId || previous.workspaceId === workspaceId));
+    if(oldId && !canResume && !forceFresh) {
+      throw new Error('Stored conversation belongs to another workspace or task; reset the Paperclip session before retrying');
+    }
+    const args=['--input-format','stream-json','--output-format','stream-json','--sandbox',
+      `--mode=${cfg.executionMode==='planning'?'plan':'default'}`, '--print-timeout',`${cfg.timeoutSec}s`];
+    args.push('--model',cfg.model);
+    if (stagedSkills.root) args.push('--add-dir', stagedSkills.root);
+    if(cfg.effort)args.push('--effort',cfg.effort);
+    if(cfg.cliAgent)args.push('--agent',cfg.cliAgent);
+    if(canResume)args.push('--conversation',oldId);
+    // Strictly reserved env: reject inherited agent identity and runtime API credentials.
+    const inherited=Object.fromEntries(Object.entries(process.env).filter(([key,value]) =>
+      typeof value==='string' && (/^(PATH|HOME|USER|LOGNAME|SHELL|TMPDIR|LANG|LC_[A-Z_]+|XDG_[A-Z_]+|SSL_CERT_FILE|NODE_EXTRA_CA_CERTS|HTTPS_PROXY|HTTP_PROXY|NO_PROXY)$/i.test(key))));
+    const env={...inherited,...helpers.buildPaperclipEnv(ctx.agent,ctx.agentIdentity),
+      ...(ctx.runtimeTools && helpers.buildRuntimeToolsEnv?helpers.buildRuntimeToolsEnv(ctx.runtimeTools):{}),
+      PAPERCLIP_RUN_ID:ctx.runId, PAPERCLIP_WORKSPACE_CWD:cwd};
+    if (workspaceId) env.PAPERCLIP_WORKSPACE_ID=workspaceId;
+    if (workspace.branch) env.PAPERCLIP_WORKSPACE_BRANCH=workspace.branch;
+    // The only source of API key is Paperclip's run-scoped, host-issued token.
+    if(ctx.authToken)env.PAPERCLIP_API_KEY=ctx.authToken;
+    const bindings={
+      PAPERCLIP_TASK_ID:maybeStr(ctx.context?.taskId)||maybeStr(ctx.context?.issueId),
+      PAPERCLIP_WAKE_REASON:maybeStr(ctx.context?.wakeReason),
+      PAPERCLIP_WAKE_COMMENT_ID:maybeStr(ctx.context?.wakeCommentId),
+      PAPERCLIP_APPROVAL_ID:maybeStr(ctx.context?.approvalId),
+      PAPERCLIP_APPROVAL_STATUS:maybeStr(ctx.context?.approvalStatus),
+    };
+    for(const [k,v] of Object.entries(bindings)) if(v)env[k]=v;
+    await ctx.onMeta?.({adapterType:'antigravity_local',command:cfg.command,cwd,
+      commandArgs:args,workspaceId,commandNotes:['Prompt sent via stdin; secrets omitted','Paperclip-assigned issue worktree verified','Sandbox enabled; permissions governed by agy user settings']});
+    await ctx.onCancellationReady?.();
+    if(ctx.signal?.aborted)throw new Error('Canceled before dispatch');
+    ctx.onDispatch?.();
+    let permissionFailure=false;
+    let logChars=0;
+    const log = async (stream,text) => {
+      // Stream model text and sanitized tool progress. Never print raw credentials or unbounded raw data.
+      if (typeof text !== 'string' || !text) return;
+      if (ctx.authToken && typeof ctx.authToken === 'string' && ctx.authToken.length > 4) {
+        text = text.replaceAll(ctx.authToken, '[REDACTED_TOKEN]');
+      }
+      if(logChars>300_000)return;
+      const limited=text.slice(0,Math.max(0,300_000-logChars));logChars+=limited.length;
+      if(limited) await ctx.onLog(stream,limited);
+    };
+    const emitAcpx = async (payload) => {
+      await log('stdout', `${JSON.stringify(payload)}\n`);
+    };
+
+    let lastAssistantSnippet = '';
+    let toolStepCounter = 0;
+    const activeToolCalls = new Map();
+
+    const proc=await runAgy({command:cfg.command,args,cwd,env,prompt,
+      timeoutMs:cfg.timeoutSec*1000,graceMs:cfg.graceSec*1000,maxBytes:cfg.maxOutputBytes,
+      signal:ctx.signal,
+      onSpawn:async(meta)=>{
+        spawned=true;
+        await ctx.onSpawn?.(meta);
+        await ctx.onRuntimeProgress?.({
+          phase: 'adapter_startup',
+          message: `Starting Antigravity harness (${cfg.model})...`,
+          currentToolName: null,
+          lastAssistantSnippet: null,
+          lastEventAt: new Date(),
+        });
+        await ctx.onEvent?.({
+          eventType: 'harness.starting',
+          stream: 'system',
+          level: 'info',
+          message: `Starting Antigravity CLI harness (${cfg.model}, ${cfg.executionMode})`,
+          payload: {
+            harness: 'antigravity',
+            model: cfg.model,
+            executionMode: cfg.executionMode,
+            workspace: cwd,
+            pid: meta.pid,
+          },
+        });
+      },
+      onEvent:async(evt)=>{
+        if(evt.event==='init') {
+          if (evt.init?.permission_mode==='always-proceed') {
+            // Explicit operator opt-in for this verified project, never fixed/pilot mode.
+            const approvedRuntime = cfg.allowUnattendedRuntime && cfg.executionMode === 'implementation' &&
+              cfg.workspaceMode === 'paperclip' && cfg.approvedProjectIds.includes(workspace.projectId);
+            if (!approvedRuntime) return false;
+          }
+          const convId = typeof evt.conversation_id === 'string' ? evt.conversation_id : null;
+          await emitAcpx({
+            type: 'acpx.session',
+            agent: 'antigravity',
+            mode: cfg.executionMode,
+            permissionMode: evt.init?.permission_mode || (cfg.allowUnattendedRuntime ? 'always-proceed' : 'sandbox'),
+            sessionId: convId,
+          });
+          await ctx.onEvent?.({
+            eventType: 'harness.ready',
+            stream: 'system',
+            level: 'info',
+            message: `Antigravity harness ready${convId ? ` (session ${convId})` : ''}`,
+            payload: {
+              harness: 'antigravity',
+              conversationId: convId,
+              tools: Array.isArray(evt.init?.tools) ? evt.init.tools : [],
+              permissionMode: evt.init?.permission_mode,
+            },
+          });
+          await ctx.onEvent?.({
+            eventType: canResume ? 'session.resumed' : 'session.started',
+            stream: 'system',
+            level: 'info',
+            message: `Session ${convId ?? 'started'}`,
+            payload: {
+              sessionId: convId,
+              model: cfg.model,
+              mode: cfg.executionMode,
+            },
+          });
+          await ctx.onRuntimeProgress?.({
+            phase: 'run_activity',
+            message: `Antigravity ready (${cfg.executionMode})`,
+            currentToolName: null,
+            lastAssistantSnippet: null,
+            lastEventAt: new Date(),
+          });
+        }
+        if(evt.event==='step_update' && isObj(evt.step_update)) {
+          const s=evt.step_update;
+          if(s.step_type==='user_input' && s.state==='DONE') {
+            await ctx.onEvent?.({
+              eventType: 'turn.started',
+              stream: 'system',
+              level: 'info',
+              message: 'Turn started',
+              payload: { stepIndex: s.step_index },
+            });
+          } else if(s.step_type==='agent_response' && typeof s.text_delta==='string' && s.text_delta) {
+            await emitAcpx({
+              type: 'acpx.text_delta',
+              text: s.text_delta,
+              channel: 'output',
+            });
+            lastAssistantSnippet = (lastAssistantSnippet + s.text_delta).slice(-200).trim();
+            await ctx.onRuntimeProgress?.({
+              phase: 'run_activity',
+              message: lastAssistantSnippet.slice(0, 160) || 'Antigravity responding...',
+              currentToolName: null,
+              lastAssistantSnippet: lastAssistantSnippet.slice(0, 200),
+              lastEventAt: new Date(),
+            });
+          } else if(s.step_type==='tool') {
+            const toolName = s.tool_name || s.tool_info?.name || 'tool';
+            const p = extractToolParameters(s);
+            const target = extractToolTarget(toolName, p);
+            const callId = String(s.step_index != null ? `tool-${s.step_index}` : (s.tool_info?.id || `tool-${++toolStepCounter}`));
+
+            if(s.state==='ACTIVE') {
+              activeToolCalls.set(callId, {
+                toolName,
+                parameters: p,
+                target,
+                toolAction: p.toolAction,
+                toolSummary: p.toolSummary,
+                startTime: Date.now(),
+              });
+
+              const activeDesc = p.toolAction
+                ? `${p.toolAction}${target ? `: ${target.slice(0, 120)}` : ''}`
+                : (target ? `Running ${toolName}: ${target.slice(0, 120)}` : `Using ${toolName}`);
+
+              await ctx.onRuntimeProgress?.({
+                phase: 'run_activity',
+                message: activeDesc.slice(0, 180),
+                currentToolName: toolName.slice(0, 80),
+                lastAssistantSnippet: lastAssistantSnippet || null,
+                lastEventAt: new Date(),
+              });
+
+              // Canonical Paperclip tool execution started event with required schema
+              await ctx.onEvent?.({
+                eventType: 'tool.execution.started',
+                stream: 'system',
+                level: 'info',
+                message: activeDesc.slice(0, 180),
+                payload: {
+                  schema: 'paperclip.tool.execution.v1',
+                  executionId: callId,
+                  transport: toolName === 'run_command' ? 'process' : 'builtin',
+                  operation: mapToolOperation(toolName),
+                  name: toolName === 'run_command' ? (target || 'Bash') : toolName,
+                  target: target ? target.slice(0, 500) : null,
+                  namespace: typeof p.Cwd === 'string' ? p.Cwd : null,
+                  readOnly: isReadOnlyTool(toolName),
+                  status: 'running',
+                  durationMs: null,
+                  exitCode: null,
+                  progress: target ? target.slice(0, 200) : null,
+                  output: '',
+                  outputBytes: 0,
+                  outputTruncated: false,
+                  outputDigest: sha256Digest(''),
+                  parameters: p,
+                },
+              });
+
+              if(toolName === 'invoke_subagent') {
+                const role = p.Role || p.TypeName || (Array.isArray(p.Subagents) ? p.Subagents.map(x=>x.Role||x.TypeName).join(', ') : 'subagent');
+                await ctx.onEvent?.({
+                  eventType: 'delegation.started',
+                  stream: 'system',
+                  level: 'info',
+                  message: `Subagent started: ${role}`,
+                  payload: {
+                    schema: 'paperclip.delegation.v1',
+                    delegationId: callId,
+                    action: 'spawn',
+                    role,
+                    typeName: p.TypeName,
+                    subagents: p.Subagents,
+                    prompt: safeText(p.Prompt || (p.Subagents ? JSON.stringify(p.Subagents) : ''), 1000),
+                  },
+                });
+              } else if(toolName === 'search_web' || toolName === 'read_url_content') {
+                await ctx.onEvent?.({
+                  eventType: 'research.started',
+                  stream: 'system',
+                  level: 'info',
+                  message: `Research started: ${target || toolName}`,
+                  payload: {
+                    schema: 'paperclip.research.v1',
+                    researchId: callId,
+                    action: toolName === 'search_web' ? 'search' : 'open_page',
+                    query: p.query,
+                    url: p.Url || p.url,
+                  },
+                });
+              }
+
+              await emitAcpx({
+                type: 'acpx.tool_call',
+                name: toolName,
+                toolCallId: callId,
+                status: 'in_progress',
+                text: target || toolName,
+                input: p,
+              });
+            } else if(s.state==='DONE') {
+              const saved = activeToolCalls.get(callId) || {};
+              activeToolCalls.delete(callId);
+              const finalParams = Object.keys(p).length > 0 ? p : (saved.parameters || {});
+              const finalTarget = target || saved.target || extractToolTarget(toolName, finalParams);
+
+              const isError = Boolean(s.tool_info?.error);
+              const errText = s.tool_info?.error?.message || (isError ? String(s.tool_info.error) : '');
+              const outputText = extractToolOutput(s);
+              const duration = typeof s.duration_seconds === 'number'
+                ? s.duration_seconds
+                : (saved.startTime ? (Date.now() - saved.startTime) / 1000 : undefined);
+              const durLabel = duration !== undefined ? ` (${duration.toFixed(2)}s)` : '';
+              const durationMs = duration !== undefined ? Math.round(duration * 1000) : 0;
+
+              const summaryLabel = saved.toolSummary || p.toolSummary || toolName;
+              const doneMessage = `${summaryLabel} ${isError ? 'failed' : 'completed'}${durLabel}`;
+
+              await ctx.onRuntimeProgress?.({
+                phase: 'run_activity',
+                message: doneMessage.slice(0, 180),
+                currentToolName: null,
+                lastAssistantSnippet: lastAssistantSnippet || null,
+                lastEventAt: new Date(),
+              });
+
+              // Canonical Paperclip tool execution completed event with full output audit
+              const boundedOut = safeText(outputText, 65536);
+              await ctx.onEvent?.({
+                eventType: 'tool.execution.completed',
+                stream: 'system',
+                level: isError ? 'warn' : 'info',
+                message: `${summaryLabel} ${isError ? 'failed' : 'completed'}${durLabel}`.slice(0, 180),
+                payload: {
+                  schema: 'paperclip.tool.execution.v1',
+                  executionId: callId,
+                  transport: toolName === 'run_command' ? 'process' : 'builtin',
+                  operation: mapToolOperation(toolName),
+                  name: toolName === 'run_command' ? (finalTarget || 'Bash') : toolName,
+                  target: finalTarget ? finalTarget.slice(0, 500) : null,
+                  namespace: typeof finalParams.Cwd === 'string' ? finalParams.Cwd : null,
+                  readOnly: isReadOnlyTool(toolName),
+                  status: isError ? 'failed' : 'completed',
+                  durationMs,
+                  exitCode: isError ? 1 : 0,
+                  progress: null,
+                  output: boundedOut,
+                  outputBytes: Buffer.byteLength(boundedOut, 'utf8'),
+                  outputTruncated: outputText.length > 65536,
+                  outputDigest: sha256Digest(boundedOut),
+                  parameters: finalParams,
+                  error: isError ? safeText(errText, 1000) : undefined,
+                },
+              });
+
+              if(toolName === 'invoke_subagent') {
+                await ctx.onEvent?.({
+                  eventType: 'delegation.completed',
+                  stream: 'system',
+                  level: isError ? 'warn' : 'info',
+                  message: `Subagent ${isError ? 'failed' : 'completed'}${durLabel}`,
+                  payload: {
+                    schema: 'paperclip.delegation.v1',
+                    delegationId: callId,
+                    status: isError ? 'failed' : 'completed',
+                    output: safeText(outputText, 2000),
+                  },
+                });
+              } else if(toolName === 'search_web' || toolName === 'read_url_content') {
+                await ctx.onEvent?.({
+                  eventType: 'research.completed',
+                  stream: 'system',
+                  level: isError ? 'warn' : 'info',
+                  message: `Research ${isError ? 'failed' : 'completed'}${durLabel}`,
+                  payload: {
+                    schema: 'paperclip.research.v1',
+                    researchId: callId,
+                    status: isError ? 'failed' : 'completed',
+                    output: safeText(outputText, 2000),
+                  },
+                });
+              }
+
+              await emitAcpx({
+                type: 'acpx.tool_call',
+                name: toolName,
+                toolCallId: callId,
+                status: isError ? 'failed' : 'completed',
+                text: finalTarget || toolName,
+                input: finalParams,
+              });
+              await emitAcpx({
+                type: 'acpx.tool_result',
+                toolUseId: callId,
+                toolName,
+                name: toolName,
+                content: outputText || (isError ? errText : 'completed'),
+                output: outputText || (isError ? errText : 'completed'),
+                isError,
+              });
+            }
+
+            if(isObj(s.tool_info?.error) && looksLikePermissionDenial(String(s.tool_info.error.message??'')))permissionFailure=true;
+          }
+
+          if(isObj(s.usage)) {
+            await ctx.onEvent?.({
+              eventType: 'usage.reported',
+              stream: 'system',
+              level: 'info',
+              payload: {
+                inputTokens: s.usage.input_tokens,
+                outputTokens: s.usage.output_tokens,
+                thinkingTokens: s.usage.thinking_tokens,
+                totalTokens: s.usage.total_tokens,
+              },
+            });
+            if(typeof s.usage.total_tokens === 'number') {
+              await emitAcpx({
+                type: 'acpx.status',
+                text: `Context: ${s.usage.total_tokens} tokens`,
+                used: s.usage.total_tokens,
+              });
+            }
+          }
+        }
+      },
+      onStderr:async(text)=>{if(looksLikePermissionDenial(text))permissionFailure=true;},
+    });
+    const classifyError = (p) => {
+      const combined = `${p.stderr || ''}\n${p.reason || ''}\n${p.final?.error || ''}`;
+      const isAuth = /(?:not\s+logged\s+into|not\s+logged\s+in|login\s+required|run\s+`?agy\s+auth(?:\s+login)?`?\s+first|please\s+authenticate|token\s+source|unauthenticated|unauthorized|invalid\s+credentials|api[_ ]?key\s+(?:required|missing|invalid)|auth(?:entication)?\s+required)/i.test(combined);
+      const isQuota = !isAuth && (/(?:RESOURCE_EXHAUSTED|quota|rate[-\s]?limit|token\s*limit|too\s+many\s+requests|\b429\b|billing\s+details|exceeded.*quota|out\s+of\s+quota|out\s+of\s+tokens)/i.test(combined) ||
+                      (p.code === 3 && /quota|rate\s*limit|limit|exhaust/i.test(combined)));
+      const isSessionLost = /conversation.*(?:not\s+found|invalid|expired)|unknown\s+session|cannot\s+resume|failed\s+to\s+resume/i.test(combined);
+      const isTurnLimit = p.code === 53 || /(?:turn_limit|max_turns)/i.test(combined);
+
+      if (isTurnLimit) {
+        return {
+          errorCode: 'agent_turn_limit_reached',
+          errorFamily: 'execution',
+          message: 'Antigravity reached maximum conversation turn limit. Task should be broken down into smaller sub-tasks.',
+          clearSession: false,
+        };
+      }
+      if (isQuota) {
+        return {
+          errorCode: 'provider_quota',
+          errorFamily: 'provider_quota',
+          message: 'Antigravity token limit / quota reached. Verify Google account quota or switch accounts.',
+          clearSession: true,
+        };
+      }
+      if (isAuth) {
+        return {
+          errorCode: 'provider_auth_error',
+          errorFamily: 'auth',
+          message: 'Antigravity authentication required or account changed. Verify Google account login via agy.',
+          clearSession: true,
+        };
+      }
+      if (isSessionLost) {
+        return {
+          errorCode: 'session_lost',
+          errorFamily: 'session',
+          message: 'Antigravity conversation session invalid or expired; resetting session.',
+          clearSession: true,
+        };
+      }
+      if (p.code === 3) {
+        return {
+          errorCode: 'provider_auth_error',
+          errorFamily: 'auth',
+          message: 'Antigravity exited 3; verify Google authentication, account selection and token quota locally',
+          clearSession: true,
+        };
+      }
+      return null;
+    };
+    const classification = classifyError(proc);
+    const fail=(message,clearSession=false,extra={})=>{
+      ctx.onRuntimeProgress?.({
+        phase: 'finalize',
+        message: `Execution failed: ${message}`.slice(0, 180),
+        currentToolName: null,
+        lastAssistantSnippet: null,
+        lastEventAt: new Date(),
+      })?.catch(()=>{});
+      ctx.onEvent?.({
+        eventType: 'harness.diagnostic',
+        stream: 'stderr',
+        level: 'error',
+        message: safeText(message, 300),
+        payload: {
+          error: message,
+          errorCode: extra.errorCode,
+          errorFamily: extra.errorFamily,
+        },
+      })?.catch(()=>{});
+      emitAcpx({
+        type: 'acpx.error',
+        message,
+        code: extra.errorCode,
+      })?.catch(()=>{});
+      return {exitCode:proc.code===0?1:proc.code??1,signal:proc.signal??null,
+      timedOut:proc.timedOut,errorMessage:message,
+      clearSession:clearSession || Boolean(canResume && (proc.code !== 0 || proc.final?.status !== 'SUCCESS')),
+      provider:'google',biller:'google',billingType:'metered_api',model:cfg.model,costStatus:'unpriced',
+      ...extra,
+      resultJson: {
+        conversationContinuation: 'continue_conversation_v1',
+        ...(extra.errorFamily ? { errorFamily: extra.errorFamily } : {}),
+        ...(isObj(extra.resultJson) ? extra.resultJson : {}),
+      }};
+    };
+    if(proc.timedOut)return fail(`Antigravity timed out after ${cfg.timeoutSec}s`);
+    if(proc.aborted)return fail('Run canceled by Paperclip');
+    if(proc.stdoutTruncated || proc.malformed)return fail('Antigravity output exceeded limit or included invalid NDJSON');
+    if(proc.reason)return fail(`Antigravity execution failed: ${proc.reason}`);
+    if(permissionFailure || looksLikePermissionDenial(proc.stderr))return fail('Antigravity denied a tool permission; run is not complete');
+    if(proc.code!==0) {
+      if (classification) {
+        return fail(classification.message, classification.clearSession, {
+          errorCode: classification.errorCode,
+          errorFamily: classification.errorFamily,
+        });
+      }
+      const firstStderrLine = proc.stderr?.split('\n').map(l=>l.trim()).find(Boolean);
+      const detail = firstStderrLine ? `: ${firstStderrLine.slice(0, 200)}` : '';
+      return fail(`Antigravity exited ${proc.code??'without status'}${detail}`);
+    }
+    if(!isObj(proc.final))return fail('Antigravity did not provide a terminal result event');
+    if(!['SUCCESS','ERROR','CANCELED','INTERRUPTED','INVALID','WAITING','RUNNING'].includes(proc.final.status) || typeof proc.final.response!=='string')return fail('Invalid Antigravity final result payload');
+    if(proc.final.status!=='SUCCESS'){
+      if (classification) {
+        return fail(classification.message, classification.clearSession, {
+          errorCode: classification.errorCode,
+          errorFamily: classification.errorFamily,
+        });
+      }
+      const lost=/conversation.*(?:not found|invalid|expired)|unknown session/i.test(String(proc.final.error??''));
+      return fail(`Antigravity reported ${proc.final.status}; inspect the corresponding CLI run for details`,lost);
+    }
+    if(!proc.final.response.trim())return fail('Antigravity reported success with an empty response');
+    if(cfg.executionMode==='planning' && (await worktreeStatus(cwd)).length) return fail('Planning run modified the worktree; manual inspection required');
+
+    let dirtyCount = 0;
+    let dirtyFiles = [];
+    try {
+      dirtyFiles = await worktreeStatus(cwd);
+      dirtyCount = dirtyFiles.length;
+    } catch {}
+
+    if (cfg.executionMode === 'implementation' && dirtyCount > 0) {
+      await ctx.onEvent?.({
+        eventType: 'worktree.dirty_warning',
+        stream: 'system',
+        level: 'warn',
+        message: `Worktree contains ${dirtyCount} uncommitted/untracked file(s) upon turn completion: ${dirtyFiles.slice(0, 5).join(', ')}${dirtyCount > 5 ? '...' : ''}`,
+        payload: {
+          dirtyFiles,
+          dirtyCount,
+          cwd,
+          branch: workspace.branch,
+        },
+      });
+    }
+
+    const id=typeof proc.final.conversation_id==='string' && /^[\w-]{5,200}$/.test(proc.final.conversation_id)?proc.final.conversation_id:null;
+    const next=id?{conversationId:id,cwd,taskKey,workspaceId,usageScope:'cumulative'}:null;
+    // Calculate estimated USD billing from real usage token counts and model rates so Paperclip tracks ledger costs.
+    const usageObj = usageOf(proc.final);
+    const estimatedCost = estimateCostUsd(cfg.model, usageObj.usage);
+    const hasReportedCost = typeof estimatedCost === 'number';
+
+    await emitAcpx({
+      type: 'acpx.result',
+      summary: safeText(proc.final.response, 300) || proc.final.status,
+      inputTokens: usageObj.usage?.inputTokens ?? 0,
+      outputTokens: usageObj.usage?.outputTokens ?? 0,
+      cachedTokens: usageObj.usage?.cachedInputTokens ?? 0,
+      costUsd: hasReportedCost ? estimatedCost : undefined,
+      isError: false,
+    });
+    await ctx.onEvent?.({
+      eventType: 'turn.completed',
+      stream: 'system',
+      level: 'info',
+      message: `Turn completed (${proc.final.status})`,
+      payload: {
+        status: proc.final.status,
+        durationSeconds: proc.final.duration_seconds,
+        usage: usageObj.usage,
+      },
+    });
+    await ctx.onEvent?.({
+      eventType: 'harness.exited',
+      stream: 'system',
+      level: 'info',
+      message: 'Antigravity harness execution completed',
+      payload: {
+        conversationId: id,
+        status: proc.final.status,
+      },
+    });
+    await ctx.onRuntimeProgress?.({
+      phase: 'finalize',
+      message: dirtyCount > 0 ? `Execution completed (${dirtyCount} uncommitted file(s))` : 'Execution completed',
+      currentToolName: null,
+      lastAssistantSnippet: safeText(proc.final.response, 200) || null,
+      lastEventAt: new Date(),
+    });
+
+    return {
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      provider: 'google',
+      biller: 'google',
+      billingType: 'metered_api',
+      model: cfg.model,
+      costStatus: hasReportedCost ? 'reported' : 'unpriced',
+      ...(hasReportedCost ? { costUsd: estimatedCost, cacheAdjustedCostUsd: estimatedCost } : {}),
+      ...usageObj,
+      sessionParams: next,
+      sessionDisplayId: id,
+      summary: safeText(proc.final.response, 1500),
+      resultJson: {
+        status: 'SUCCESS',
+        conversationContinuation: 'continue_conversation_v1',
+        response: safeText(proc.final.response, 20000),
+        conversation_id: id,
+        worktree: {
+          branch: workspace.branch,
+          dirtyCount,
+          dirtyFiles: dirtyFiles.slice(0, 20),
+        },
+      },
+    };
+  } catch(err) {
+    return {exitCode:1,signal:null,timedOut:false,errorMessage:errorText(err),
+      ...(!spawned?{executionRecovery:{kind:'bootstrap',providerWorkStarted:false}}:{}),
+      resultJson: {
+        conversationContinuation: 'continue_conversation_v1',
+      },
+    };
+  } finally {
+    if (stagedSkills) await stagedSkills.cleanup();
+  }
+}
+export async function execute(ctx) {
+  const helpers=await import('@paperclipai/adapter-utils/server-utils');
+  return executeWithHelpers(ctx,helpers);
+}

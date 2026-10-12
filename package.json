@@ -1,0 +1,55 @@
+{
+  "name": "paperclip-adapter-antigravity",
+  "version": "0.2.12",
+  "description": "Google Antigravity (AGY) CLI adapter for Paperclip AI agent orchestration with real-time UI streaming, multi-turn session persistence, and fail-closed security",
+  "type": "module",
+  "author": "Nirnay Kulshreshtha <nirnaykulshreshtha@gmail.com>",
+  "license": "MIT",
+  "homepage": "https://github.com/nirnaykulshreshtha/paperclip-adapter-antigravity#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nirnaykulshreshtha/paperclip-adapter-antigravity.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nirnaykulshreshtha/paperclip-adapter-antigravity/issues"
+  },
+  "keywords": [
+    "paperclip",
+    "paperclip-adapter",
+    "antigravity",
+    "google-antigravity",
+    "agy",
+    "ai-agents",
+    "agent-orchestration",
+    "autonomous-agents",
+    "coding-agents",
+    "developer-tools",
+    "llm",
+    "gemini"
+  ],
+  "engines": {
+    "node": ">=22.16.0"
+  },
+  "exports": {
+    ".": "./src/index.js",
+    "./server": "./src/server/index.js",
+    "./ui-parser": "./src/ui/parse-stdout.js"
+  },
+  "paperclip": {
+    "adapterUiParser": "1.0.0"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "check": "node --check src/index.js && node --check src/ui/parse-stdout.js && node --check src/server/execute.js && node --check src/server/test.js && node --check src/lib/process.js && node --check src/lib/models.js && node --check src/lib/probe.js && node --check src/lib/assigned-workspace.js && node --check src/lib/skills.js && node --check src/lib/pricing.js",
+    "smoke": "node scripts/local-smoke.js",
+    "models:check": "node scripts/check-models.js"
+  },
+  "dependencies": {
+    "@paperclipai/adapter-utils": "2026.1005.0"
+  }
+}
