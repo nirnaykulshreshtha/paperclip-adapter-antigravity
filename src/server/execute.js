@@ -1,4 +1,4 @@
-import { realpath } from 'node:fs/promises';
+import { realpath, access, symlink } from 'node:fs/promises';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { normalizeConfig } from '../lib/config.js';
@@ -173,7 +173,7 @@ export function formatToolProgress(s) {
 }
 
 /** Build a bounded prompt without duplicating arbitrary private server context. */
-export function buildPrompt(ctx, cfg, instr, helpers, skillIndex = '') {
+export function buildPrompt(ctx, cfg, instr, helpers, skillIndex = '', options = {}) {
   const context = isObj(ctx.context)?ctx.context:{};
   const templateData={
     agentId:ctx.agent.id,companyId:ctx.agent.companyId,runId:ctx.runId,
@@ -186,14 +186,44 @@ export function buildPrompt(ctx, cfg, instr, helpers, skillIndex = '') {
   const sections=[helpers.renderTemplate(main,templateData)];
   if(instr) sections.push('## Paperclip-managed agent instructions\n'+instr);
   if(skillIndex) sections.push(skillIndex);
-  sections.push('## Wake context\n'+[
+
+  const wakeItems = [
     ['Task ID', context.taskId??context.issueId],
-    ['Task title',context.taskTitle],
-    ['Task description',context.taskDescription??context.description],
-    ['Wake reason',context.wakeReason],
-    ['Wake comment',context.wakeCommentBody],
-  ].filter(x=>typeof x[1]==='string' && x[1]).map(x=>`${x[0]}: ${safeText(x[1],20000)}`).join('\n'));
-  sections.push(`## Repository and execution rules\nRead and comply with the repository AGENTS.md and applicable SKILL.md.\nExecution mode: ${cfg.executionMode}. `+
+    ['Task identifier', context.identifier??context.taskIdentifier],
+    ['Task title', context.taskTitle],
+    ['Task priority', context.priority],
+    ['Parent epic / issue ID', context.parentId??context.parentIssueId],
+    ['Parent epic title', context.parentTitle??context.parentIssueTitle],
+    ['Parent epic description', context.parentDescription],
+    ['Upstream blockers / dependencies', Array.isArray(context.dependencies) ? context.dependencies.join(', ') : context.dependencies],
+    ['Task description', context.taskDescription??context.description],
+    ['Wake reason', context.wakeReason],
+    ['Wake comment', context.wakeCommentBody],
+  ].filter(x=>typeof x[1]==='string' && x[1]).map(x=>`${x[0]}: ${safeText(x[1],20000)}`);
+
+  if (wakeItems.length) {
+    sections.push('## Wake context\n' + wakeItems.join('\n'));
+  }
+
+  if (options.graphifyAvailable || context.graphifyAvailable) {
+    sections.push(`## Codebase Knowledge Graph (Graphify)\n` +
+      `A pre-indexed codebase knowledge graph is active (7,500+ nodes) at \`graphify-out/graph.json\`.\n` +
+      `Before running wide greps or scanning directories across the repository:\n` +
+      `- Query architecture & relationships: \`graphify query "<question>"\`\n` +
+      `- Trace data flow or call chain: \`graphify path "<source_symbol>" "<target_symbol>"\`\n` +
+      `- Explain a component/service: \`graphify explain "<symbol_name>"\`\n` +
+      `Always check the knowledge graph first to locate the right files, modules, models, and endpoints.`);
+  }
+
+  sections.push(`## Cross-Agent Squad Collaboration & Context Sharing\n` +
+    `You are part of an integrated multi-agent engineering squad:\n` +
+    `- Delivery Lead coordinates assignments, breaks down epics, and unblocks agents.\n` +
+    `- Technical Architect defines system design and interface contracts.\n` +
+    `- Specialist agents (Backend, Frontend, Database, Integrations, QA, Release) own their respective domains.\n` +
+    `- Shared deliverables: When completing work or encountering blockers, post structured comments in Paperclip detailing changed files, new endpoints/schemas, and test verification results so other squad members stay in sync.\n` +
+    `- Cross-domain delegation: When you need work from another specialist domain, create or request child tasks in Paperclip rather than implementing outside your role mandate.`);
+
+  sections.push(`## Repository and execution rules\nRead and comply with the repository AGENTS.md (especially Section 3.1: Context Hygiene & Anti-Looping Rules) and applicable SKILL.md.\nExecution mode: ${cfg.executionMode}. `+
     (cfg.executionMode==='planning'?'Plan and research only. Do not modify any files, run migrations, push Git changes, or deploy. If a write is needed, ask the human for permission in Paperclip and stop.':'Modify files only in the dedicated worktree; no production access, migrations or deployment without human authorization.')+
     '\nWhen a tool permission is denied, report it explicitly; do not claim success or work around the policy. Track decisions and blockers in Paperclip, and do not reveal secrets.');
   const prompt=sections.filter(Boolean).join('\n\n');
@@ -261,7 +291,24 @@ export async function executeWithHelpers(ctx, helpers) {
     }
     const instructions=await readInstructions(cfg.instructionsFilePath);
     stagedSkills=await stageAssignedSkills(ctx.config);
-    const prompt=buildPrompt(ctx,cfg,instructions,helpers,stagedSkills.index);
+
+    // Ensure graphify knowledge base is accessible inside isolated worktree checkouts
+    const worktreeGraphify = path.join(cwd, 'graphify-out');
+    const repoGraphify = cfg.repositoryRoot ? path.join(cfg.repositoryRoot, 'graphify-out') : null;
+    let hasGraphify = await access(path.join(worktreeGraphify, 'graph.json')).then(() => true).catch(() => false);
+    if (!hasGraphify && repoGraphify) {
+      const repoHasGraphify = await access(path.join(repoGraphify, 'graph.json')).then(() => true).catch(() => false);
+      if (repoHasGraphify) {
+        try {
+          await symlink(repoGraphify, worktreeGraphify, 'dir');
+          hasGraphify = true;
+        } catch {
+          hasGraphify = await access(path.join(worktreeGraphify, 'graph.json')).then(() => true).catch(() => false);
+        }
+      }
+    }
+
+    const prompt=buildPrompt(ctx,cfg,instructions,helpers,stagedSkills.index, { graphifyAvailable: hasGraphify });
     const workspaceId=maybeStr(workspace.workspaceId);
     const previous=ctx.runtime?.sessionParams;
     const oldId=sessionIdFrom(previous);
@@ -292,6 +339,9 @@ export async function executeWithHelpers(ctx, helpers) {
     const env={...inherited,...helpers.buildPaperclipEnv(ctx.agent,ctx.agentIdentity),
       ...(ctx.runtimeTools && helpers.buildRuntimeToolsEnv?helpers.buildRuntimeToolsEnv(ctx.runtimeTools):{}),
       PAPERCLIP_RUN_ID:ctx.runId, PAPERCLIP_WORKSPACE_CWD:cwd};
+    const userLocalBin = path.join(process.env.HOME || '', '.local', 'bin');
+    const pathParts = [userLocalBin, '/opt/homebrew/bin', '/usr/local/bin', ...(typeof env.PATH === 'string' ? env.PATH.split(':') : [])].filter(Boolean);
+    env.PATH = Array.from(new Set(pathParts)).join(':');
     if (workspaceId) env.PAPERCLIP_WORKSPACE_ID=workspaceId;
     if (workspace.branch) env.PAPERCLIP_WORKSPACE_BRANCH=workspace.branch;
     // The only source of API key is Paperclip's run-scoped, host-issued token.

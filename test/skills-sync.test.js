@@ -126,3 +126,21 @@ test('keeps trusted script execute permission in ephemeral bundle and never writ
  await bundle.cleanup();
  await assert.rejects(access(path.join(f.secondary,'.agents','skills','governance')));
 });
+test('buildPrompt includes Graphify knowledge base, epic context, and cross-agent collaboration',async t=>{
+ const f=await fixture(t);
+ const {ctx}=fakeContext(f.config);
+ ctx.context={
+  taskId:'issue-100',identifier:'BUC-100',taskTitle:'Wire webhook handler',priority:'high',
+  parentId:'epic-14',parentTitle:'Billing & Wallet',
+  parentDescription:'Product pillar: Razorpay wallet and payment integrity',
+  dependencies:['BUC-99 (database migration)'],
+  taskDescription:'Implement idempotency checks',wakeReason:'assigned',
+ };
+ const prompt=buildPrompt(ctx,{...f.config,executionMode:'implementation',maxPromptBytes:500000},'Do the work',helpers,'',{graphifyAvailable:true});
+ assert.match(prompt,/Codebase Knowledge Graph \(Graphify\)/);
+ assert.match(prompt,/graphify query "<question>"/);
+ assert.match(prompt,/Parent epic title: Billing & Wallet/);
+ assert.match(prompt,/Upstream blockers \/ dependencies: BUC-99 \(database migration\)/);
+ assert.match(prompt,/Cross-Agent Squad Collaboration & Context Sharing/);
+ assert.match(prompt,/Delivery Lead coordinates assignments/);
+});
