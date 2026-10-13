@@ -1040,7 +1040,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       model: cfg.model,
       costStatus: 'unpriced',
       usage:usageObj.usage||undefined,
-      usageBasis:usageObj.usageBasis,
+      usageBasis:usageObj.usage?'per_run':null,
       sessionParams:next,
       sessionDisplayId: id,
       summary: safeText(proc.final.response, 1500),

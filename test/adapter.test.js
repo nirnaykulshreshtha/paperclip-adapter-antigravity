@@ -29,7 +29,7 @@ test('successful response records real session and usage; hides token from logs'
  assert.equal(r.exitCode,0,JSON.stringify(r));
  assert.equal(r.sessionParams.conversationId,'abcde-123');
  assert.equal(r.usage.inputTokens,123);
- assert.equal(r.usageBasis,'turn_delta');
+ assert.equal(r.usageBasis,'per_run');
  assert.equal(r.costStatus,'unpriced');
  assert.equal(r.costUsd,undefined);
  assert.equal(r.billingType,'external_cli_unverified');
