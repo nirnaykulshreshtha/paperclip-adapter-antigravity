@@ -65,9 +65,10 @@ export function parseStdoutLine(line, ts) {
       const toolName = String(parsed.name || 'tool');
       const toolUseId = pickToolUseId(parsed) || `tool-${Date.now()}`;
       const status = String(parsed.status || 'in_progress');
-      const input = parsed.input && typeof parsed.input === 'object'
-        ? parsed.input
-        : (parsed.text ? { detail: parsed.text } : {});
+      const args = parsed.input ?? parsed.parameters ?? parsed.args;
+      const input = args && typeof args === 'object'
+        ? args
+        : (args !== undefined ? { raw: args } : (parsed.text ? { detail: parsed.text } : {}));
 
       const entries = [{
         kind: 'tool_call',
@@ -75,17 +76,22 @@ export function parseStdoutLine(line, ts) {
         name: toolName,
         toolUseId,
         input,
+        target: parsed.target ?? null,
+        startedAt: parsed.startedAt ?? null,
       }];
 
       if (status === 'completed' || status === 'failed' || status === 'cancelled') {
-        const text = parsed.text ? String(parsed.text) : status;
+        const content = stringify(parsed.output ?? parsed.content ?? parsed.error ?? parsed.text ?? status);
         entries.push({
           kind: 'tool_result',
           ts,
           toolUseId,
           toolName,
-          content: text,
+          content,
           isError: status !== 'completed',
+          durationMs: parsed.durationMs,
+          outputTruncated: parsed.outputTruncated === true,
+          error: parsed.error ?? null,
         });
       }
       return entries;
@@ -104,6 +110,9 @@ export function parseStdoutLine(line, ts) {
         toolName,
         content,
         isError,
+        durationMs: parsed.durationMs,
+        outputTruncated: parsed.outputTruncated === true,
+        error: parsed.error ?? null,
       }];
     }
 
@@ -170,6 +179,8 @@ export function parseStdoutLine(line, ts) {
           name: toolName,
           toolUseId,
           input: typeof params === 'object' && params !== null ? params : { raw: params },
+          target: parsed.tool_info?.target ?? null,
+          startedAt: parsed.started_at ?? null,
         }];
       }
 
@@ -183,6 +194,8 @@ export function parseStdoutLine(line, ts) {
           toolName,
           content: stringify(out),
           isError,
+          durationMs: typeof parsed.duration_seconds === 'number' ? Math.round(parsed.duration_seconds * 1000) : undefined,
+          error: parsed.tool_info?.error ?? null,
         }];
       }
     }

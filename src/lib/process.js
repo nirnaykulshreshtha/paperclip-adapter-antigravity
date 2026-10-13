@@ -8,8 +8,48 @@ export async function runAgy({ command, args, cwd, env, prompt, timeoutMs, grace
     let stdoutBytes=0, stderr='', partial='', malformed=false, final=null, stdoutTruncated=false;
     let timeoutId, killId, timedOut=false, aborted=false, closed=false, settled=false, spawnError=null;
     let pending = Promise.resolve();
+    // Slow event consumers must not build an unbounded in-memory queue. Pause
+    // both streams and let OS pipe buffers apply backpressure until handlers catch up.
+    const HIGH_WATER = 128;
+    const LOW_WATER = 48;
+    let queueDepth = 0;
+    const queueMetrics = { enqueued: 0, peakDepth: 0, peakWaitMs: 0, totalWaitMs: 0, handlerErrors: 0, pausedCount: 0 };
+    let streamsPaused = false;
+    const pauseStreams = () => {
+      if (streamsPaused || queueDepth < HIGH_WATER) return;
+      streamsPaused = true;
+      queueMetrics.pausedCount++;
+      proc?.stdout?.pause();
+      proc?.stderr?.pause();
+    };
+    const resumeStreams = () => {
+      if (!streamsPaused || queueDepth > LOW_WATER) return;
+      streamsPaused = false;
+      proc?.stdout?.resume();
+      proc?.stderr?.resume();
+    };
     const decoder = new StringDecoder('utf8');
-    const queue = (fn) => { pending = pending.then(fn).catch(e=>{ spawnError ||= e; requestStop('SIGTERM'); }); };
+    const queue = (fn) => {
+      const enqueuedAt = performance.now();
+      queueDepth++;
+      queueMetrics.enqueued++;
+      queueMetrics.peakDepth = Math.max(queueMetrics.peakDepth, queueDepth);
+      pauseStreams();
+      pending = pending.then(async () => {
+        const waitMs = performance.now() - enqueuedAt;
+        queueMetrics.peakWaitMs = Math.max(queueMetrics.peakWaitMs, waitMs);
+        queueMetrics.totalWaitMs += waitMs;
+        try { await fn(); }
+        catch (e) {
+          queueMetrics.handlerErrors++;
+          spawnError ||= e;
+          requestStop('SIGTERM');
+        } finally {
+          queueDepth--;
+          resumeStreams();
+        }
+      });
+    };
     const cleanup = () => {
       clearTimeout(timeoutId); clearTimeout(killId);
       signal?.removeEventListener('abort',abort);
@@ -29,7 +69,7 @@ export async function runAgy({ command, args, cwd, env, prompt, timeoutMs, grace
     const finish=async(code,sig)=>{
       if(settled) return; settled=true; cleanup();
       await pending;
-      resolve({code,signal:sig,timedOut,aborted,stderr,final,malformed,stdoutTruncated,reason:spawnError?.message});
+      resolve({code,signal:sig,timedOut,aborted,stderr,final,malformed,stdoutTruncated,reason:spawnError?.message,queueMetrics:{...queueMetrics,avgWaitMs:queueMetrics.enqueued ? queueMetrics.totalWaitMs/queueMetrics.enqueued : 0}});
     };
     try {
       proc=spawn(command,args,{cwd,env,stdio:['pipe','pipe','pipe'],shell:false,detached:process.platform!=='win32',windowsHide:true});

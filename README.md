@@ -105,3 +105,17 @@ npm test
 For the native Paperclip package, reload the external adapter after installation.
 Avoid manually copying a changed `execute.js` into an older adapter without the
 updated `test` files and package metadata.
+
+## Execution history and detailed tool calls
+
+Each execution writes an append-only JSONL journal to `~/.paperclip/antigravity-traces/<sha256-run-id-prefix>.jsonl` (or `config.traceDirectory`). The journal contains phase transitions, sanitized raw CLI events, stderr, Paperclip events, process exit, and terminal state. For every reported Antigravity tool call it additionally stores `tool.started`, `tool.completed` or `tool.interrupted`, including call ID, name, target, available parameters, timestamps, duration, full CLI-provided output up to the journal's per-field 256 KiB limit, output bytes/digest, and errors. The adapter cannot capture output that Antigravity's CLI itself does not emit.
+
+Generate an offline, searchable, expandable history report:
+
+```sh
+node scripts/trace-report.mjs RUN_ID ./run-history.html
+# or
+node scripts/trace-report.mjs /path/to/trace.jsonl ./run-history.html
+```
+
+The report contains potentially sensitive prompts, file contents, and tool output. Keep it private. A 32 MiB cap per trace prevents unbounded storage; `journal.truncated` marks when the cap is reached. Older traces require periodic deletion or a separate retention policy. Runtime Paperclip UI rendering is host-controlled; the built-in offline viewer provides a complete view of captured events even if the host activity panel doesn't display them.

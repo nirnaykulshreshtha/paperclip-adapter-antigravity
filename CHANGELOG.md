@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.3 — execution trace journal, backpressure and offline viewer
+
+- Add append-only JSONL execution journal (`src/lib/journal.js`) at `~/.paperclip/antigravity-traces/<hash>.jsonl`.
+- Record detailed lifecycle and tool invocation tracing (`tool.started`, `tool.completed`, `tool.interrupted`) with sanitized arguments/output and token redaction.
+- Add backpressure queue metrics and high/low stream watermarks in `src/lib/process.js` to guard against unbounded memory buffers.
+- Add offline trace viewer generator (`scripts/trace-report.mjs`) exporting searchable self-contained HTML reports.
+- Expand `parseStdoutLine` to capture target, startedAt, durationMs, and error fields from tool lifecycle events.
+
 ## 0.3.1 — fast deterministic test harness
 
 - Move live model discovery after host execution-target, assigned-workspace, authorization and clean-worktree guards.

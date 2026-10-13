@@ -42,13 +42,14 @@
     "src",
     "scripts/statusline-snapshot.mjs",
     "scripts/doctor.mjs",
+    "scripts/trace-report.mjs",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
     "test": "node --test test/*.test.js",
-    "check": "node --check src/index.js && node --check src/server/index.js && node --check src/server/execute.js && node --check src/server/test.js && node --check src/ui/parse-stdout.js && node --check src/lib/account.js && node --check src/lib/account-pool.js && node --check src/lib/statusline.js && node --check src/lib/usage.js && node --check src/lib/quota.js && node --check src/lib/models.js && node --check src/lib/process.js && node --check src/lib/pricing.js && node --check scripts/statusline-snapshot.mjs",
+    "check": "node --check src/index.js && node --check src/server/index.js && node --check src/server/execute.js && node --check src/server/test.js && node --check src/ui/parse-stdout.js && node --check src/lib/account.js && node --check src/lib/account-pool.js && node --check src/lib/statusline.js && node --check src/lib/usage.js && node --check src/lib/quota.js && node --check src/lib/models.js && node --check src/lib/process.js && node --check src/lib/pricing.js && node --check src/lib/journal.js && node --check scripts/statusline-snapshot.mjs && node --check scripts/trace-report.mjs",
     "smoke": "node scripts/local-smoke.js",
     "models:check": "node scripts/check-models.js",
     "doctor": "node scripts/doctor.mjs"

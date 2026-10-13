@@ -1,4 +1,5 @@
 import { realpath, access, symlink } from 'node:fs/promises';
+import { createJournal } from '../lib/journal.js';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { normalizeConfig } from '../lib/config.js';
@@ -255,8 +256,33 @@ export function sanitizeTelemetry(value, authToken, depth=0) {
 export async function executeWithHelpers(ctx, helpers, { discoverModels = discoverAgyModels } = {}) {
   let spawned=false;
   let stagedSkills=null;
-  const emitEvent=event=>ctx.onEvent?.(sanitizeTelemetry(event,ctx.authToken));
+  let journal=null;
+  let terminalWritten=false;
+  const startedAt=performance.now();
+  let cliStartedAt=null;
+  let spawnedAfterMs=null;
+  let lastPhase='initialization';
+  let lastPhaseAt=startedAt;
+  const phaseDurationsMs={};
+  let phase='initialization';
+  const trace=async(kind,data={})=>{
+    const now=performance.now();
+    if (kind==='phase.started' && phase!==lastPhase) {
+      phaseDurationsMs[lastPhase]=(phaseDurationsMs[lastPhase]||0)+Math.round(now-lastPhaseAt);
+      lastPhase=phase;
+      lastPhaseAt=now;
+    }
+    if(journal) await journal.append(kind,{phase,elapsedMs:Math.round(now-startedAt),...data});
+  };
+  const emitEvent=async(event)=>{
+    const safe=sanitizeTelemetry(event,ctx.authToken);
+    await trace('paperclip.event',safe);
+    await ctx.onEvent?.(safe);
+  };
+  const terminal=async(status,details={})=>{if(terminalWritten)return; terminalWritten=true;await trace('run.terminal',{status,...details});};
   try {
+    journal=await createJournal({runId:ctx.runId,root:ctx.config?.traceDirectory,token:ctx.authToken});
+    await trace('run.started',{adapter:'antigravity'});
     if (typeof ctx.authToken !== 'string' || !ctx.authToken.trim()) {
       throw new Error('Antigravity execution requires a host-issued run-scoped Paperclip API token');
     }
@@ -268,6 +294,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     // If Paperclip wakes the agent on a heartbeat or on-demand without an assigned issue/task,
     // handle it cleanly as an idle heartbeat check instead of crashing on worktree resolution.
     if (cfg.workspaceMode === 'paperclip' && !hasAssignedTask) {
+      await terminal('success',{reason:'idle_heartbeat'});
       return {
         exitCode: 0,
         signal: null,
@@ -286,6 +313,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
         },
       };
     }
+    phase='workspace_validation'; await trace('phase.started');
     const workspace = cfg.workspaceMode === 'paperclip'
       ? await resolveAssignedWorkspace(ctx, cfg)
       : await validateWorkspace(cfg);
@@ -301,6 +329,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     }
     // Preflight authorization must run BEFORE potentially slow external CLI discovery.
     // Unit tests inject deterministic discovery without changing production behavior.
+    phase='model_validation'; await trace('phase.started');
     if (cfg.validateSelectedModelOnRun) {
       const available = await discoverModels({ config: cfg });
       if (!Array.isArray(available) || !available.some(entry => entry?.id === cfg.model)) {
@@ -319,6 +348,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
         });
       }
     }
+    phase='skills_and_instructions'; await trace('phase.started');
     const instructions=await readInstructions(cfg.instructionsFilePath);
     stagedSkills=await stageAssignedSkills(ctx.config);
 
@@ -349,8 +379,9 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     if (oldId && typeof previous?.cwd === 'string' && path.isAbsolute(previous.cwd)) {
       previousCwd = await realpath(previous.cwd).catch(() => null);
     }
+    phase='account_detection'; await trace('phase.started');
     const observed = await readObservedStatus().catch(()=>null);
-    const activeAccount=await detectActiveAccount().catch(()=>null);
+    const activeAccount=observed?.email ? {email:observed.email,source:'statusline'} : await detectActiveAccount().catch(()=>null);
     const currentAccountEmail=activeAccount?.email||null;
     if(currentAccountEmail) {
       const file=cfg.accountPoolFile||undefined;
@@ -497,6 +528,8 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     let resumeConvId = canResume ? oldId : null;
     const runArgs=buildArgs(cfg.model,resumeConvId);
     let proc = null;
+    phase='cli_execution'; await trace('phase.started',{model:cfg.model,promptBytes:Buffer.byteLength(prompt)});
+    cliStartedAt=performance.now();
     // The CLI owns account selection. Never re-run side-effectful turns under a different account.
       proc = await runAgy({
         command: cfg.command,
@@ -508,6 +541,8 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       signal:ctx.signal,
       onSpawn:async(meta)=>{
         spawned=true;
+        spawnedAfterMs=Math.round(performance.now()-startedAt);
+        await trace('process.spawn',{...meta,preflightMs:spawnedAfterMs});
         await ctx.onSpawn?.(meta);
         await ctx.onRuntimeProgress?.({
           phase: 'adapter_startup',
@@ -531,6 +566,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
         });
       },
       onEvent:async(evt)=>{
+        await trace('cli.event',evt);
         if(evt.event==='init') {
           if (evt.init?.permission_mode==='always-proceed') {
             // Explicit operator opt-in for this verified project, never fixed/pilot mode.
@@ -615,8 +651,10 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
                 toolAction: p.toolAction,
                 toolSummary: p.toolSummary,
                 startTime: Date.now(),
+                startedAt: new Date().toISOString(),
               });
 
+              await trace('tool.started',{executionId:callId,name:toolName,parameters:p,target,startedAt:activeToolCalls.get(callId).startedAt});
               const activeDesc = p.toolAction
                 ? `${p.toolAction}${target ? `: ${target.slice(0, 120)}` : ''}`
                 : (target ? `Running ${toolName}: ${target.slice(0, 120)}` : `Using ${toolName}`);
@@ -645,6 +683,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
                   namespace: typeof p.Cwd === 'string' ? p.Cwd : null,
                   readOnly: isReadOnlyTool(toolName),
                   status: 'running',
+                  startedAt:activeToolCalls.get(callId).startedAt,
                   durationMs: null,
                   exitCode: null,
                   progress: target ? target.slice(0, 200) : null,
@@ -713,6 +752,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
               const durationMs = duration !== undefined ? Math.round(duration * 1000) : 0;
 
               const summaryLabel = saved.toolSummary || p.toolSummary || toolName;
+              await trace('tool.completed',{executionId:callId,name:toolName,parameters:finalParams,target:finalTarget,startedAt:saved.startedAt??null,completedAt:new Date().toISOString(),durationMs,status:isError?'failed':'completed',output:outputText,outputBytes:Buffer.byteLength(outputText,'utf8'),outputDigest:sha256Digest(outputText),error:isError?errText:null});
               const doneMessage = `${summaryLabel} ${isError ? 'failed' : 'completed'}${durLabel}`;
 
               await ctx.onRuntimeProgress?.({
@@ -741,6 +781,8 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
                   readOnly: isReadOnlyTool(toolName),
                   status: isError ? 'failed' : 'completed',
                   durationMs,
+                  startedAt:saved.startedAt??null,
+                  completedAt:new Date().toISOString(),
                   exitCode: isError ? 1 : 0,
                   progress: null,
                   output: boundedOut,
@@ -817,24 +859,44 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
           }
         }
       },
-      onStderr: async (text) => { if (looksLikePermissionDenial(text)) permissionFailure = true; },
+      onStderr: async (text) => { await trace('cli.stderr',{text}); if (looksLikePermissionDenial(text)) permissionFailure = true; },
     });
 
+    phase='finalization'; await trace('phase.started');
+    const runtimeDurationMs=cliStartedAt===null?null:Math.round(performance.now()-cliStartedAt);
+    const performancePayload={
+      totalElapsedMs:Math.round(performance.now()-startedAt),
+      preflightMs:spawnedAfterMs,
+      cliDurationMs:runtimeDurationMs,
+      phaseDurationsMs:{...phaseDurationsMs},
+      eventQueue:proc.queueMetrics??null,
+    };
+    await trace('process.exit',{code:proc.code,signal:proc.signal,timedOut:proc.timedOut,reason:proc.reason,performance:performancePayload});
+    await emitEvent({
+      eventType:'harness.performance',stream:'system',level:'info',
+      message:'Antigravity execution timing and event-queue diagnostics',
+      payload:performancePayload,
+    });
+    for(const [callId,tool] of activeToolCalls) {
+      await trace('tool.interrupted',{executionId:callId,name:tool.toolName,parameters:tool.parameters,target:tool.target,startedAt:tool.startedAt,interruptedAt:new Date().toISOString(),durationMs:Date.now()-tool.startTime});
+      await emitEvent({eventType:'tool.execution.interrupted',stream:'system',level:'warn',message:`${tool.toolName} interrupted by process termination`,payload:{executionId:callId,status:'interrupted',durationMs:Date.now()-tool.startTime}});
+    }
+    activeToolCalls.clear();
     if(classifyError(proc)?.errorCode==='provider_quota' && currentAccountEmail) {
       const detail=`${proc.stderr||''} ${proc.reason||''} ${proc.final?.error||''}`;
       await markAccountQuotaExhausted(currentAccountEmail,null,parseQuotaResetDuration(detail),'provider_quota',
         cfg.accountPoolFile||undefined,cfg.model).catch(()=>{});
     }
   const classification = classifyError(proc);
-    const fail=(message,clearSession=false,extra={})=>{
-      ctx.onRuntimeProgress?.({
+    const fail=async(message,clearSession=false,extra={})=>{
+      await ctx.onRuntimeProgress?.({
         phase: 'finalize',
         message: `Execution failed: ${message}`.slice(0, 180),
         currentToolName: null,
         lastAssistantSnippet: null,
         lastEventAt: new Date(),
-      })?.catch(()=>{});
-      emitEvent({
+      }).catch(()=>{});
+      await emitEvent({
         eventType: 'harness.diagnostic',
         stream: 'stderr',
         level: 'error',
@@ -844,12 +906,13 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
           errorCode: extra.errorCode,
           errorFamily: extra.errorFamily,
         },
-      })?.catch(()=>{});
-      emitAcpx({
+      }).catch(()=>{});
+      await emitAcpx({
         type: 'acpx.error',
         message,
         code: extra.errorCode,
-      })?.catch(()=>{});
+      }).catch(()=>{});
+      await terminal('failed',{message,code:proc.code,...extra});
       return {exitCode:proc.code===0?1:proc.code??1,signal:proc.signal??null,
       timedOut:proc.timedOut,errorMessage:message,
       clearSession:clearSession || Boolean(canResume && (proc.code !== 0 || proc.final?.status !== 'SUCCESS')),
@@ -861,42 +924,42 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
         ...(isObj(extra.resultJson) ? extra.resultJson : {}),
       }};
     };
-    if(proc.timedOut)return fail(`Antigravity timed out after ${cfg.timeoutSec}s`);
-    if(proc.aborted)return fail('Run canceled by Paperclip');
-    if(proc.stdoutTruncated || proc.malformed)return fail('Antigravity output exceeded limit or included invalid NDJSON');
-    if(logTruncated)return fail('Paperclip task transcript hit its configured size limit; execution is not fully auditable');
-    if(proc.reason)return fail(`Antigravity execution failed: ${proc.reason}`);
-    if(permissionFailure || looksLikePermissionDenial(proc.stderr))return fail('Antigravity denied a tool permission; run is not complete');
+    if(proc.timedOut)return await fail(`Antigravity timed out after ${cfg.timeoutSec}s`);
+    if(proc.aborted)return await fail('Run canceled by Paperclip');
+    if(proc.stdoutTruncated || proc.malformed)return await fail('Antigravity output exceeded limit or included invalid NDJSON');
+    if(logTruncated)return await fail('Paperclip task transcript hit its configured size limit; execution is not fully auditable');
+    if(proc.reason)return await fail(`Antigravity execution failed: ${proc.reason}`);
+    if(permissionFailure || looksLikePermissionDenial(proc.stderr))return await fail('Antigravity denied a tool permission; run is not complete');
     if(proc.code!==0) {
       if (classification) {
         let msg = classification.message;
-        return fail(msg, classification.clearSession, {
+        return await fail(msg, classification.clearSession, {
           errorCode: classification.errorCode,
           errorFamily: classification.errorFamily,
         });
       }
       const firstStderrLine = proc.stderr?.split('\n').map(l=>l.trim()).find(Boolean);
       const detail = firstStderrLine ? `: ${firstStderrLine.slice(0, 200)}` : '';
-      return fail(`Antigravity exited ${proc.code??'without status'}${detail}`);
+      return await fail(`Antigravity exited ${proc.code??'without status'}${detail}`);
     }
-    if(!isObj(proc.final))return fail('Antigravity did not provide a terminal result event');
-    if(!['SUCCESS','ERROR','CANCELED','INTERRUPTED','INVALID','WAITING','RUNNING'].includes(proc.final.status) || typeof proc.final.response!=='string')return fail('Invalid Antigravity final result payload');
+    if(!isObj(proc.final))return await fail('Antigravity did not provide a terminal result event');
+    if(!['SUCCESS','ERROR','CANCELED','INTERRUPTED','INVALID','WAITING','RUNNING'].includes(proc.final.status) || typeof proc.final.response!=='string')return await fail('Invalid Antigravity final result payload');
     if(proc.final.status!=='SUCCESS'){
       if (classification) {
         let msg = classification.message;
-        return fail(msg, classification.clearSession, {
+        return await fail(msg, classification.clearSession, {
           errorCode: classification.errorCode,
           errorFamily: classification.errorFamily,
         });
       }
       const lost=/conversation.*(?:not found|invalid|expired)|unknown session/i.test(String(proc.final.error??''));
-      return fail(`Antigravity reported ${proc.final.status}; inspect the corresponding CLI run for details`,lost);
+      return await fail(`Antigravity reported ${proc.final.status}; inspect the corresponding CLI run for details`,lost);
     }
-    if(!proc.final.response.trim())return fail('Antigravity reported success with an empty response');
+    if(!proc.final.response.trim())return await fail('Antigravity reported success with an empty response');
     const afterAccount=await detectActiveAccount().catch(()=>null);
     if(currentAccountEmail && afterAccount?.email && currentAccountEmail!==afterAccount.email)
-      return fail('AGY account changed during execution; session must not be reused',true,{errorFamily:'auth'});
-    if(cfg.executionMode==='planning' && (await worktreeStatus(cwd)).length) return fail('Planning run modified the worktree; manual inspection required');
+      return await fail('AGY account changed during execution; session must not be reused',true,{errorFamily:'auth'});
+    if(cfg.executionMode==='planning' && (await worktreeStatus(cwd)).length) return await fail('Planning run modified the worktree; manual inspection required');
 
     let dirtyCount = 0;
     let dirtyFiles = [];
@@ -966,6 +1029,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       lastEventAt: new Date(),
     });
 
+    await terminal('success',{conversationId:id});
     return {
       exitCode: 0,
       signal: null,
@@ -994,6 +1058,11 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       },
     };
   } catch(err) {
+    const message=errorText(err);
+    await trace('run.exception',{message,phase,elapsedMs:Math.round(performance.now()-startedAt),phaseDurationsMs}).catch(()=>{});
+    await ctx.onRuntimeProgress?.({phase:'finalize',message:`Execution failed: ${message}`.slice(0,180),currentToolName:null,lastAssistantSnippet:null,lastEventAt:new Date()}).catch(()=>{});
+    await emitEvent({eventType:'harness.diagnostic',stream:'stderr',level:'error',message:safeText(message,300),payload:{phase,error:message}}).catch(()=>{});
+    await terminal('failed',{message,phase}).catch(()=>{});
     return {exitCode:1,signal:null,timedOut:false,errorMessage:errorText(err),
       ...(!spawned?{executionRecovery:{kind:'bootstrap',providerWorkStarted:false}}:{}),
       resultJson: {
@@ -1002,6 +1071,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     };
   } finally {
     if (stagedSkills) await stagedSkills.cleanup();
+    if (journal) await journal.close();
   }
 }
 export async function execute(ctx) {
