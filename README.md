@@ -1,3 +1,5 @@
+> **Unofficial YourClientDesk efficiency patch for the supplied adapter v0.3.2.** This package adds compact prompt continuation and a Paperclip handoff protocol. See [docs/YOURCLIENTDESK_PAPERCLIP_OPTIMIZATION.md](docs/YOURCLIENTDESK_PAPERCLIP_OPTIMIZATION.md). This patch has not been tested with an authenticated AGY/Paperclip production installation. The upstream version number remains 0.3.2 for compatibility; do not mistake it for an upstream release.
+
 # Paperclip adapter — Antigravity CLI (0.3.0)
 
 A **native external Paperclip adapter**, updated from the supplied v0.2.12 archive. No separate HTTP bridge or UI service is required. Preserves the existing `antigravity_local` adapter type, Paperclip execution/workspace guardrails, skills staging, model APIs, and UI parser contract.
@@ -119,3 +121,4 @@ node scripts/trace-report.mjs /path/to/trace.jsonl ./run-history.html
 ```
 
 The report contains potentially sensitive prompts, file contents, and tool output. Keep it private. A 32 MiB cap per trace prevents unbounded storage; `journal.truncated` marks when the cap is reached. Older traces require periodic deletion or a separate retention policy. Runtime Paperclip UI rendering is host-controlled; the built-in offline viewer provides a complete view of captured events even if the host activity panel doesn't display them.
+

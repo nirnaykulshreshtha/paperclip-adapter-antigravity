@@ -45,7 +45,8 @@
     "scripts/trace-report.mjs",
     "README.md",
     "CHANGELOG.md",
-    "LICENSE"
+    "LICENSE",
+    "docs"
   ],
   "scripts": {
     "test": "node --test test/*.test.js",

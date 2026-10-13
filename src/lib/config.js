@@ -51,6 +51,10 @@ export function normalizeConfig(raw = {}) {
   if (approvedProjectIds.length && workspaceMode !== 'paperclip') {
     throw new Error('Project implementation authorization requires Paperclip isolated workspaces');
   }
+  const promptPolicy = text(raw.promptPolicy, 'compact_resume');
+  if (!['compact_resume', 'full_every_turn'].includes(promptPolicy)) {
+    throw new Error('promptPolicy must be compact_resume or full_every_turn');
+  }
   const accountPoolFile = text(raw.accountPoolFile);
   if (accountPoolFile && !path.isAbsolute(accountPoolFile)) {
     throw new Error('accountPoolFile must be an absolute path');
@@ -72,6 +76,7 @@ export function normalizeConfig(raw = {}) {
     graceSec: int(raw.graceSec, 10, 2, 60),
     maxOutputBytes: int(raw.maxOutputBytes, 3_000_000, 8192, 16_000_000),
     maxPromptBytes: int(raw.maxPromptBytes, 100_000, 1024, 500_000),
+    promptPolicy,
     promptTemplate: typeof raw.promptTemplate === 'string' ? raw.promptTemplate : '',
     instructionsFilePath: instr,
   };
@@ -96,6 +101,7 @@ export const configSchema = {
     { key: 'graceSec', label: 'Cancellation grace (seconds)', type: 'number', default: 10 },
     { key: 'validateSelectedModelOnRun', label: 'Validate model against live AGY models before execution', type: 'toggle', default: true },
     { key: 'accountPoolFile', label: 'Observed account state file (optional)', type: 'text', hint: 'Does not store or switch credentials' },
+    { key: 'promptPolicy', label: 'Resumed conversation prompt policy', type: 'select', default: 'compact_resume', options: [{label:'Compact: send only new task context and active skill paths',value:'compact_resume'},{label:'Legacy: send full prompt on every turn',value:'full_every_turn'}], hint:'Compact mode applies only after a verified previous turn; fresh and legacy sessions receive the full prompt' },
     { key: 'promptTemplate', label: 'Paperclip prompt template (optional)', type: 'textarea', hint: 'Uses Paperclip placeholders like {{agent.name}}, {{context.taskTitle}}' },
   ],
 };

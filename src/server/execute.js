@@ -177,9 +177,55 @@ export function formatToolProgress(s) {
   return null;
 }
 
+/** Stable task fingerprint, excluding volatile wake comments and per-run identifiers. */
+export function staticTaskDigest(context = {}) {
+  const fields = [
+    'taskId', 'issueId', 'identifier', 'taskIdentifier', 'taskTitle',
+    'taskDescription', 'description', 'priority', 'parentId',
+    'parentIssueId', 'parentTitle', 'parentIssueTitle', 'parentDescription',
+    'dependencies',
+  ];
+  return sha256Digest(JSON.stringify(Object.fromEntries(fields.map(key => [key, context[key] ?? null]))));
+}
+
 /** Build a bounded prompt without duplicating arbitrary private server context. */
 export function buildPrompt(ctx, cfg, instr, helpers, skillIndex = '', options = {}) {
   const context = isObj(ctx.context)?ctx.context:{};
+  if (options.compactResume) {
+    // AGY --conversation must already have been verified against task, account,
+    // model and canonical workspace. Previously delivered instructions remain
+    // in that conversation; do not keep appending them on every wake.
+    const messages = [
+      '## Continue assigned Paperclip task',
+      'Resume the existing conversation and its approved instructions. Do not restart completed investigation or repeat already reported work. Check current worktree state and the latest task changes before acting. Keep permission, review and release gates unchanged.',
+      `Task ID: ${safeText(context.taskId ?? context.issueId ?? ctx.runtime?.taskKey ?? '', 128)}`,
+    ];
+    if (options.staticContextChanged) {
+      for (const [label, value] of [
+        ['Task title', context.taskTitle],
+        ['Task description', context.taskDescription ?? context.description],
+        ['Parent epic / issue ID', context.parentId ?? context.parentIssueId],
+        ['Parent epic title', context.parentTitle ?? context.parentIssueTitle],
+        ['Parent epic description', context.parentDescription],
+        ['Upstream blockers / dependencies', Array.isArray(context.dependencies) ? context.dependencies.join(', ') : context.dependencies],
+      ]) {
+        if (typeof value === 'string' && value) messages.push(`${label}: ${safeText(value, 20000)}`);
+      }
+    }
+    for (const [label, value] of [
+      ['Wake reason', context.wakeReason],
+      ['Wake comment', context.wakeCommentBody],
+      ['Approval status', context.approvalStatus],
+    ]) {
+      if (typeof value === 'string' && value) messages.push(`${label}: ${safeText(value, 4000)}`);
+    }
+    // Skill directories are rematerialized in a different temporary location
+    // each run. Their live paths MUST be refreshed, even in a compact turn.
+    if (skillIndex) messages.push(skillIndex);
+    const prompt=messages.join('\n\n');
+    if (Buffer.byteLength(prompt,'utf8')>cfg.maxPromptBytes) throw new Error('Resumed prompt exceeds maxPromptBytes');
+    return prompt;
+  }
   const templateData={
     agentId:ctx.agent.id,companyId:ctx.agent.companyId,runId:ctx.runId,
     agent:{id:ctx.agent.id,name:ctx.agent.name},
@@ -221,12 +267,13 @@ export function buildPrompt(ctx, cfg, instr, helpers, skillIndex = '', options =
   }
 
   sections.push(`## Cross-Agent Squad Collaboration & Context Sharing\n` +
-    `You are part of an integrated multi-agent engineering squad:\n` +
-    `- Delivery Lead coordinates assignments, breaks down epics, and unblocks agents.\n` +
-    `- Technical Architect defines system design and interface contracts.\n` +
-    `- Specialist agents (Backend, Frontend, Database, Integrations, QA, Release) own their respective domains.\n` +
-    `- Shared deliverables: When completing work or encountering blockers, post structured comments in Paperclip detailing changed files, new endpoints/schemas, and test verification results so other squad members stay in sync.\n` +
-    `- Cross-domain delegation: When you need work from another specialist domain, create or request child tasks in Paperclip rather than implementing outside your role mandate.`);
+    `- Delivery Lead coordinates assignments; Technical Architect owns shared interface contracts; specialists own assigned implementation scopes.\n` +
+    `- Before editing, inspect the current issue, assigned owner, dependencies, existing worktree commits and latest handoff; verify existing solutions rather than repeating research.\n` +
+    `- One implementation owner per issue/file scope. Do not simultaneously rewrite another agent's files. Ask the Delivery Lead for a cross-domain child task or a scoped ownership transfer.\n` +
+    `- For API/schema changes needed by another agent, publish a minimal versioned interface contract in the shared Paperclip issue before implementing consumers.\n` +
+    `- On a blocker, post BLOCKED with exact dependency and unblock criterion, then stop rather than polling or doing unrelated work.\n` +
+    `- At handoff, post one concise Paperclip comment: STATUS, COMMIT/BRANCH, FILES, INTERFACES, TESTS, BLOCKERS, NEXT OWNER. Avoid lengthy narratives and duplicate summaries.\n` +
+    `- QA verifies the integrated change; Release promotes only after approvals. Do not mark another agent's tests or deployment as completed.`);
 
   sections.push(`## Repository and execution rules\nRead and comply with the repository AGENTS.md (especially Section 3.1: Context Hygiene & Anti-Looping Rules) and applicable SKILL.md.\nExecution mode: ${cfg.executionMode}. `+
     (cfg.executionMode==='planning'?'Plan and research only. Do not modify any files, run migrations, push Git changes, or deploy. If a write is needed, ask the human for permission in Paperclip and stop.':'Modify files only in the dedicated worktree; no production access, migrations or deployment without human authorization.')+
@@ -368,7 +415,16 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       }
     }
 
-    const prompt=buildPrompt(ctx,cfg,instructions,helpers,stagedSkills.index, { graphifyAvailable: hasGraphify });
+    // Ephemeral skill staging paths change on every run; replace the changing
+    // root when fingerprinting the logically identical bootstrap policy.
+    const stableSkillsIndex=stagedSkills.root
+      ? stagedSkills.index.replaceAll(stagedSkills.root,'[STAGED_SKILL_ROOT]')
+      : stagedSkills.index;
+    const promptSignature=sha256Digest(JSON.stringify({
+      template:cfg.promptTemplate || helpers.DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE || '',
+      instructions, skills:stableSkillsIndex, executionMode:cfg.executionMode,
+    }));
+    const contextFingerprint=staticTaskDigest(isObj(ctx.context) ? ctx.context : {});
     const workspaceId=maybeStr(workspace.workspaceId);
     const previous=ctx.runtime?.sessionParams;
     const oldId=sessionIdFrom(previous);
@@ -405,7 +461,11 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       payload:{previousAccount,currentAccount:currentAccountEmail}});
     const modelChanged=Boolean(previous?.model && previous.model!==cfg.model);
     const previousAccountNowUnknown=Boolean(previousAccount && !currentAccountEmail);
-    const forceFresh=Boolean(ctx.context?.forceFreshSession || accountChanged || modelChanged || previousAccountNowUnknown);
+    // Don't silently preserve an old system policy if the role instructions
+    // or assigned skill inventory have changed. Legacy sessions that predate
+    // the fingerprints get one full prompt before compact continuation.
+    const promptChanged=Boolean(previous?.promptSignature && previous.promptSignature!==promptSignature);
+    const forceFresh=Boolean(ctx.context?.forceFreshSession || accountChanged || modelChanged || previousAccountNowUnknown || promptChanged);
     const canResume = Boolean(!forceFresh && oldId && previousCwd === cwd &&
       (!previous.taskKey || previous.taskKey === taskKey) &&
       (!previous.workspaceId || previous.workspaceId === workspaceId) &&
@@ -414,6 +474,14 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     if (oldId && !canResume && !forceFresh) {
       throw new Error('Stored conversation belongs to another workspace or task; reset the Paperclip session before retrying');
     }
+    const compactResume=Boolean(cfg.promptPolicy==='compact_resume' && canResume &&
+      previous?.promptSignature === promptSignature && previous?.contextFingerprint);
+    const promptMode=compactResume?'compact_resume':'full';
+    const prompt=buildPrompt(ctx,cfg,instructions,helpers,stagedSkills.index, {
+      graphifyAvailable:hasGraphify,
+      compactResume,
+      staticContextChanged:previous?.contextFingerprint!==contextFingerprint,
+    });
     const buildArgs = (modelToUse, resumeConvId) => {
       const a = ['--input-format', 'stream-json', '--output-format', 'stream-json', '--sandbox',
         `--mode=${cfg.executionMode === 'planning' ? 'plan' : 'default'}`, '--print-timeout', `${cfg.timeoutSec}s`];
@@ -528,7 +596,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     let resumeConvId = canResume ? oldId : null;
     const runArgs=buildArgs(cfg.model,resumeConvId);
     let proc = null;
-    phase='cli_execution'; await trace('phase.started',{model:cfg.model,promptBytes:Buffer.byteLength(prompt)});
+    phase='cli_execution'; await trace('phase.started',{model:cfg.model,promptMode,promptBytes:Buffer.byteLength(prompt)});
     cliStartedAt=performance.now();
     // The CLI owns account selection. Never re-run side-effectful turns under a different account.
       proc = await runAgy({
@@ -987,7 +1055,8 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     // AGY result counters are cumulative for a resumed conversation.
     const usageObj=usageSince(proc.final.usage,canResume?previous?.usageTotals:null,{isResume:canResume});
     const next=id?{conversationId:id,cwd,taskKey,workspaceId,model:cfg.model,account:currentAccountEmail,
-      usageScope:'cumulative',usageTotals:usageObj.usageTotals}:null;
+      usageScope:'cumulative',usageTotals:usageObj.usageTotals,
+      promptSignature,contextFingerprint}:null;
     // Subscription CLI usage is not an authenticated metered API invoice.
     const hasReportedCost=false;
     await emitAcpx({
@@ -1050,6 +1119,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
         response: safeText(proc.final.response, 20000),
         conversation_id: id,
         account: currentAccountEmail,
+        promptStats:{mode:promptMode,bytes:Buffer.byteLength(prompt)},
         worktree: {
           branch: workspace.branch,
           dirtyCount,
