@@ -67,7 +67,7 @@ test('unconfigured onboarding probes with few tokens but does not claim workspac
     probe:async()=>({ok:true,tokens:{totalTokens:16}}),
   });
   assert.equal(r.status,'warn');
-  assert.ok(r.checks.some(c=>c.code==='auth'&&c.level==='info'&&c.message.includes('16 total tokens')));
+  assert.ok(r.checks.some(c=>c.code==='hello_probe_passed'&&c.level==='info'&&c.message.includes('16 total tokens')));
   assert.ok(r.checks.some(c=>c.code==='workspace'&&c.level==='warn'));
 });
 
@@ -83,4 +83,31 @@ test('environment test reports failed live probe as an error',async(t)=>{
 test('model probe never executes without an explicit model', async()=>{
  await assert.rejects(runMinimalProbe({command:'/path/agy',model:'default'}),/explicit Antigravity model/);
  await assert.rejects(runMinimalProbe({command:'/path/agy'}),/explicit Antigravity model/);
+});
+
+
+test('Paperclip lifecycle accepts only a successful authenticated hello probe', async (t) => {
+  const f = await fixture(t);
+  // Gate mirrors assertHarnessTestPassed in Paperclip server/src/services/agent-harness-verification.ts.
+  const acceptedByHost = result => {
+    const verified = result.checks.some(check => check.level === 'info' &&
+      (/hello_probe_(passed|succeeded)$/.test(check.code) || check.code === 'ai_connection_api_key_reverified'));
+    const authenticationFailed = result.checks.some(check =>
+      check.code === 'adapter_auth_missing' || /_hello_probe_auth_required$/.test(check.code));
+    const incomplete = !verified && (result.status === 'warn' || result.checks.some(check => check.code.includes('hello_probe')));
+    return result.status !== 'fail' && !authenticationFailed && !incomplete;
+  };
+  const configured = {command: f.exe, model: 'gemini-3.8-flash-low'};
+  const passed = await testEnvironment({config:{...configured,probeAuthentication:true}}, {
+    probe: async () => ({ok:true, tokens:{totalTokens:16}}),
+  });
+  assert.equal(passed.status,'warn'); // Workspace and sandbox warnings are valid.
+  assert.ok(passed.checks.some(c=>c.code==='hello_probe_passed' && c.level==='info'));
+  assert.equal(acceptedByHost(passed),true);
+  const skipped = await testEnvironment({config:{...configured,probeAuthentication:false}});
+  assert.equal(acceptedByHost(skipped),false);
+  const failed = await testEnvironment({config:{...configured,probeAuthentication:true}}, {
+    probe: async () => ({ok:false,reason:'Model quota exhausted.'}),
+  });
+  assert.equal(acceptedByHost(failed),false);
 });

@@ -59,6 +59,10 @@ export function normalizeConfig(raw = {}) {
   if (accountPoolFile && !path.isAbsolute(accountPoolFile)) {
     throw new Error('accountPoolFile must be an absolute path');
   }
+  const sandboxAuthJsonPath = text(raw.sandboxAuthJsonPath);
+  if (sandboxAuthJsonPath && !path.isAbsolute(sandboxAuthJsonPath)) {
+    throw new Error('sandboxAuthJsonPath must be an absolute path');
+  }
   return {
     approvedProjectIds: [...new Set(approvedProjectIds)],
     allowUnattendedRuntime: raw.allowUnattendedRuntime === true,
@@ -71,6 +75,7 @@ export function normalizeConfig(raw = {}) {
     validateSelectedModelOnRun: raw.validateSelectedModelOnRun !== false,
     accountPoolFile: accountPoolFile || null,
     timeoutSec: int(raw.timeoutSec, 300, 30, 3600),
+    outputInactivityTimeoutMs: raw.outputInactivityTimeoutMs === null ? null : (typeof raw.outputInactivityTimeoutMs === 'number' ? raw.outputInactivityTimeoutMs : undefined),
     probeAuthentication: raw.probeAuthentication !== false,
     probeTimeoutSec: int(raw.probeTimeoutSec, 35, 10, 120),
     graceSec: int(raw.graceSec, 10, 2, 60),
@@ -79,6 +84,7 @@ export function normalizeConfig(raw = {}) {
     promptPolicy,
     promptTemplate: typeof raw.promptTemplate === 'string' ? raw.promptTemplate : '',
     instructionsFilePath: instr,
+    sandboxAuthJsonPath: sandboxAuthJsonPath || null,
   };
 }
 export const configSchema = {

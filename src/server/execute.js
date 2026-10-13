@@ -1,11 +1,13 @@
-import { realpath, access, symlink } from 'node:fs/promises';
+import { realpath, access, symlink, readFile } from 'node:fs/promises';
 import { createJournal } from '../lib/journal.js';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { normalizeConfig } from '../lib/config.js';
 import { validateWorkspace, worktreeStatus, checkBranchFreshness, readInstructions } from '../lib/workspace.js';
 import { resolveAssignedWorkspace } from '../lib/assigned-workspace.js';
-import { stageAssignedSkills } from '../lib/skills.js';
+import { stageAssignedSkills, selectedSkillEntries } from '../lib/skills.js';
+import { preparePromptBundle } from '../lib/prompt-bundle-cache.js';
+import { copyBackAntigravityAuth, resolveAntigravityHostAuthPath, resolveAntigravityAuthCacheEntryPath } from '../lib/auth-cache.js';
 import { runAgy } from '../lib/process.js';
 import { errorText, looksLikePermissionDenial, sessionIdFrom, usageOf, isObj } from '../lib/result.js';
 import { usageSince } from '../lib/usage.js';
@@ -305,6 +307,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
   let stagedSkills=null;
   let journal=null;
   let terminalWritten=false;
+  let cfg=null;
   const startedAt=performance.now();
   let cliStartedAt=null;
   let spawnedAfterMs=null;
@@ -333,7 +336,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     if (typeof ctx.authToken !== 'string' || !ctx.authToken.trim()) {
       throw new Error('Antigravity execution requires a host-issued run-scoped Paperclip API token');
     }
-    const cfg=normalizeConfig(ctx.config);
+    cfg=normalizeConfig(ctx.config);
     if (ctx.executionTarget?.kind && ctx.executionTarget.kind !== 'local') throw new Error('Only local execution targets are permitted');
     const taskKey=maybeStr(ctx.runtime?.taskKey)||maybeStr(ctx.context?.taskKey)||maybeStr(ctx.context?.taskId)||maybeStr(ctx.context?.issueId);
     const hasAssignedTask=Boolean(taskKey);
@@ -398,6 +401,17 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     phase='skills_and_instructions'; await trace('phase.started');
     const instructions=await readInstructions(cfg.instructionsFilePath);
     stagedSkills=await stageAssignedSkills(ctx.config);
+    try {
+      const selectedSkills = selectedSkillEntries(ctx.config);
+      await preparePromptBundle({
+        companyId: ctx.agent?.companyId || 'default',
+        skills: selectedSkills,
+        instructionsContents: instructions,
+        env: process.env,
+      });
+    } catch {
+      // Non-blocking prompt bundle cache preparation
+    }
 
     // Ensure graphify knowledge base is accessible inside isolated worktree checkouts
     const worktreeGraphify = path.join(cwd, 'graphify-out');
@@ -606,6 +620,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
         env,
         prompt,
       timeoutMs:cfg.timeoutSec*1000,graceMs:cfg.graceSec*1000,maxBytes:cfg.maxOutputBytes,
+      outputInactivityTimeoutMs: cfg.outputInactivityTimeoutMs,
       signal:ctx.signal,
       onSpawn:async(meta)=>{
         spawned=true;
@@ -1142,6 +1157,27 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
   } finally {
     if (stagedSkills) await stagedSkills.cleanup();
     if (journal) await journal.close();
+    const sandboxAuthPath = cfg?.sandboxAuthJsonPath || ctx?.sandboxAuthJsonPath || ctx?.context?.sandboxAuthJsonPath;
+    if (sandboxAuthPath) {
+      try {
+        await copyBackAntigravityAuth({
+          readSandboxAuth: () => readFile(sandboxAuthPath),
+          hostAuthPath: resolveAntigravityHostAuthPath(process.env),
+          log: async (msg) => {
+            await emitEvent({
+              eventType: 'auth.copyback',
+              stream: 'system',
+              level: 'info',
+              message: msg,
+              payload: {},
+            }).catch(() => {});
+          },
+          resolveCacheEntryPath: (accountId) =>
+            resolveAntigravityAuthCacheEntryPath(process.env, accountId, ctx.agent?.companyId || 'default'),
+          env: process.env,
+        });
+      } catch {}
+    }
   }
 }
 export async function execute(ctx) {

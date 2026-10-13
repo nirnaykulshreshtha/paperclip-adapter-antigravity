@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.0 — Production Parity: Auth Lifecycle, Credential Readiness, Prompt Bundles & Diagnostics
+
+- **Credential Lifecycle & Cache**: Multi-tenant company-scoped auth cache (`src/lib/auth-cache.js`) with atomic file swaps, 0700/0600 modes, path traversal guards, and `withDirectoryMergeLock`.
+- **Auth Precedence**: 4-tier precedence resolver (`configured_api_key` > `host_keychain` > `cached_company_auth` > `sandbox_auth_json`) with shadowing detection (`src/lib/auth-precedence.js`).
+- **Pre-Dispatch Credential Readiness**: Pre-check evaluator (`src/lib/credential-readiness.js`) enabling Paperclip UI to gate agent launch pre-flight and surface login requirements immediately.
+- **Teardown Auth Copyback**: `copyBackAntigravityAuth` installing strictly-newer sandbox credentials back to host default stores on teardown with clock-skew detection (`src/lib/auth-cache.js`).
+- **Headless Device Login Runner**: PTY-based interactive pairing driver (`src/server/login-runner.js`) parsing Google OAuth device codes and URLs.
+- **Prompt Bundle Caching & Skills Symlinks**: SHA-256 fingerprinting of instructions and skills with materialized symlinks under `.agents/skills/` (`src/lib/prompt-bundle-cache.js`), wired into `src/server/execute.js`.
+- **Output Inactivity Monitor**: Configurable activity monitor (`src/lib/inactivity-monitor.js`) with SIGTERM and SIGKILL escalation grace.
+- **Safe Probe Diagnostics**: Structured diagnostic loggers and strict Google OAuth URL normalizers preventing credential leaks in UI check messages (`src/lib/probe-diagnostics.js`).
+- **Canonical UI Config Builder**: `./ui` package export exposing `buildAntigravityLocalConfig` for standard Paperclip forms (`src/ui/build-config.js`).
+- **Canonical Check Codes**: Emits canonical `adapter_auth_missing` check code on missing auth.
+
 ## 0.3.3 — execution trace journal, backpressure and offline viewer
 
 - Add append-only JSONL execution journal (`src/lib/journal.js`) at `~/.paperclip/antigravity-traces/<hash>.jsonl`.

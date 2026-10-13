@@ -4,8 +4,20 @@ import { resolveAssignedWorkspace } from '../lib/assigned-workspace.js';
 import { runAgy } from '../lib/process.js';
 import { resolveAgyCommand } from '../lib/models.js';
 import { probeWithCache } from '../lib/probe.js';
-export async function testEnvironment(ctx, { probe = probeWithCache } = {}) {
+import { evaluateAntigravityCredentialReadiness } from '../lib/credential-readiness.js';
+import {
+  buildAdapterTestTargetCheck,
+  buildAntigravityLoginRequiredHint,
+  classifyThrownErrorClass,
+  logAntigravityProbeDiagnostic,
+} from '../lib/probe-diagnostics.js';
+
+export async function testEnvironment(ctx, { probe = probeWithCache, evaluateReadiness = evaluateAntigravityCredentialReadiness } = {}) {
   const checks=[]; const add=(code,level,message,hint)=>checks.push({code,level,message,hint});
+  checks.push(buildAdapterTestTargetCheck({
+    targetIsRemote: ctx?.executionTarget && ctx.executionTarget.kind !== 'local',
+    environmentName: ctx?.environmentName,
+  }));
   // Paperclip's initial onboarding often probes the adapter BEFORE it exposes
   // per-agent working-directory fields. Do not report an authentication error
   // or claim readiness: warn about the missing config while allowing the UI
@@ -20,7 +32,7 @@ export async function testEnvironment(ctx, { probe = probeWithCache } = {}) {
     try {cfg=normalizeConfig(raw);add('config','info','Configuration parses correctly');}
     catch(err){add('config','error',err.message);return {adapterType:'antigravity_local',status:'fail',checks,testedAt:new Date().toISOString()};}
   }
-  if(ctx.executionTarget && ctx.executionTarget.kind && ctx.executionTarget.kind!=='local') {
+  if(ctx?.executionTarget && ctx.executionTarget.kind && ctx.executionTarget.kind!=='local') {
     add('target','error','Only local execution targets are supported. Remote targets are deliberately disabled');
   }
   if (!unconfigured) {
@@ -52,6 +64,17 @@ export async function testEnvironment(ctx, { probe = probeWithCache } = {}) {
       add('auth','error','probeTimeoutSec must be between 10 and 120 seconds');
     } else {
       try {
+        const readiness = await evaluateReadiness({
+          companyId: ctx?.agent?.companyId || ctx?.companyId || 'default',
+          configuredApiKey: raw.apiKey || process.env.ANTIGRAVITY_API_KEY || process.env.GEMINI_API_KEY,
+          accountId: raw.accountId || ctx?.agent?.adapterConfig?.accountId,
+          sandboxAuthJson: raw.sandboxAuthJson,
+          env: process.env,
+        }).catch(() => null);
+        if (readiness?.ready) {
+          add('credential_readiness', 'info', `Antigravity credentials ready (${readiness.authMode} mode via ${readiness.source}).`);
+        }
+
         const probeResult = await probe({command:cfg.command,model:cfg.model,probeTimeoutSec:Number(cfg.probeTimeoutSec)});
         if (probeResult.ok) {
           const u = probeResult.tokens ?? {};
@@ -60,10 +83,15 @@ export async function testEnvironment(ctx, { probe = probeWithCache } = {}) {
             : Number.isInteger(u.inputTokens) && Number.isInteger(u.outputTokens)
               ? `${u.inputTokens} input + ${u.outputTokens} output tokens`
               : 'token count unavailable';
-          add('auth','info',`Authenticated Antigravity model responded successfully (${probeResult.cached?'cached result; ':''}${usage}).`);
-        } else add('auth','error',`Minimal model probe failed: ${probeResult.reason}`);
-      } catch {
-        add('auth','error','Minimal model probe encountered an unexpected error; inspect local CLI authentication.');
+          add('hello_probe_passed','info',`Authenticated Antigravity model responded successfully (${probeResult.cached?'cached result; ':''}${usage}).`);
+        } else {
+          const isAuthError = /(?:authentication|unauthenticated|unauthorized|not logged in|credentials)/i.test(probeResult.reason || '');
+          add(isAuthError ? 'adapter_auth_missing' : 'auth','error',`Minimal model probe failed: ${probeResult.reason}`, isAuthError ? buildAntigravityLoginRequiredHint() : undefined);
+        }
+      } catch (err) {
+        const errorClass = classifyThrownErrorClass(err);
+        logAntigravityProbeDiagnostic('Minimal model probe encountered an unexpected error', 'probe_exception', { errorClass });
+        add('adapter_auth_missing','error','Minimal model probe encountered an unexpected error; inspect local CLI authentication.', buildAntigravityLoginRequiredHint());
       }
     }
   } else {
