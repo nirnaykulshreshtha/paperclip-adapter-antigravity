@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.1 — Runtime Permission Policy Authorization & Structured Error Classification
+
+- **Unattended Stream-JSON Authorization**: Real headless `agy` processes emit `init.permission_mode === 'always-proceed'`. Authorized unattended execution across planning mode (`executionMode === 'planning'`), issue-scoped worktrees (`cfg.approvedIssueIds`), and verified legacy fixed workspaces.
+- **Configurable `allowUnattendedRuntime`**: Added `allowUnattendedRuntime` toggle (default: `true`) to `configSchema.fields` and normalized configuration, aligning with Paperclip's unattended design while allowing operators to disable auto-approvals when required.
+- **Structured Error Classification**: Upgraded runtime permission policy failures and denials to emit structured `errorCode: 'permission_denied'` and `errorFamily: 'permission'`, preventing uninformative generic `adapter_failed` errors.
+- **Comprehensive Permission Policy Test Suite**: Added dedicated regression coverage in `test/permission-policy.test.js` validating planning mode, issue-authorized implementation, fixed workspaces, and explicit failure when `allowUnattendedRuntime: false`.
+
 ## 0.4.0 — Production Parity: Auth Lifecycle, Credential Readiness, Prompt Bundles & Diagnostics
 
 - **Credential Lifecycle & Cache**: Multi-tenant company-scoped auth cache (`src/lib/auth-cache.js`) with atomic file swaps, 0700/0600 modes, path traversal guards, and `withDirectoryMergeLock`.

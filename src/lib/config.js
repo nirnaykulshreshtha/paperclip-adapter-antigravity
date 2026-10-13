@@ -65,7 +65,7 @@ export function normalizeConfig(raw = {}) {
   }
   return {
     approvedProjectIds: [...new Set(approvedProjectIds)],
-    allowUnattendedRuntime: raw.allowUnattendedRuntime === true,
+    allowUnattendedRuntime: raw.allowUnattendedRuntime !== false,
     approvedIssueIds: [...new Set(approvedIssueIds.map(x=>x.trim()))],
     command, cwd, allowedWorkspaceRoot: root, repositoryRoot, workspaceMode, executionMode: mode,
     enableImplementation: raw.enableImplementation === true,
@@ -97,6 +97,7 @@ export const configSchema = {
     { key: 'allowedWorkspaceRoot', label: 'Authorized issue worktrees parent directory', type: 'text', required: true },
     { key: 'executionMode', label: 'Execution mode', type: 'select', default: 'planning', options: [{ label: 'Planning (pilot)', value: 'planning' }, { label: 'Implementation (opt-in)', value: 'implementation' }] },
     { key: 'enableImplementation', label: 'Authorize implementation in the isolated worktree', type: 'toggle', default: false },
+    { key: 'allowUnattendedRuntime', label: 'Allow unattended runtime', type: 'toggle', default: true, hint: 'Permit non-interactive stream-json execution in Antigravity sandbox (default: true)' },
     { key: 'approvedProjectIds', label: 'Operator-authorized implementation project UUIDs', type: 'text', hint: 'Set via the API as a UUID array; requires verified Paperclip isolated workspaces' },
     { key: 'approvedIssueIds', label: 'Human-approved issue IDs (comma-separated; implementation only)', type: 'text', hint: 'Only these Paperclip issue IDs may be edited; required for dynamic implementation' },
     { key: 'sandbox', label: 'Enable Antigravity terminal sandbox', type: 'toggle', default: true, hint: 'Required; does not isolate all filesystem operations' },

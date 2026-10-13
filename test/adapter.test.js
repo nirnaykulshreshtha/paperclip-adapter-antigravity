@@ -61,7 +61,9 @@ test('resumes known conversation only within same workspace and task',async(t)=>
 test('fails closed for CLI ERROR, malformed output, missing final result and permission denial',async(t)=>{
  const f=await fixture(t);
  for(const label of ['SCENARIO_ERROR','SCENARIO_MALFORMED','SCENARIO_NO_RESULT','SCENARIO_SOFT_DENY','SCENARIO_AUTO_APPROVE']){
-  const {ctx}=fakeContext(f.config,label); const r=await executeWithHelpers(ctx, helpers, testDeps);
+  const {ctx}=fakeContext(f.config,label);
+  if (label === 'SCENARIO_AUTO_APPROVE') ctx.config.allowUnattendedRuntime = false;
+  const r=await executeWithHelpers(ctx, helpers, testDeps);
   assert.notEqual(r.exitCode,0,`${label}: ${JSON.stringify(r)}`);
  }
 });

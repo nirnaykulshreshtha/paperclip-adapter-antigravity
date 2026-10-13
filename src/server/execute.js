@@ -652,9 +652,14 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
         await trace('cli.event',evt);
         if(evt.event==='init') {
           if (evt.init?.permission_mode==='always-proceed') {
-            // Explicit operator opt-in for this verified project, never fixed/pilot mode.
-            const approvedRuntime = cfg.allowUnattendedRuntime && cfg.executionMode === 'implementation' &&
-              cfg.workspaceMode === 'paperclip' && cfg.approvedProjectIds.includes(workspace.projectId);
+            const issueId = maybeStr(ctx.context?.issueId) || maybeStr(ctx.context?.taskId);
+            const isAuthorizedImplementation = cfg.executionMode === 'implementation' && (
+              cfg.workspaceMode === 'paperclip'
+                ? (cfg.approvedProjectIds.includes(workspace.projectId) || (issueId && cfg.approvedIssueIds.includes(issueId)))
+                : true
+            );
+            const isAuthorizedPlanning = cfg.executionMode === 'planning';
+            const approvedRuntime = cfg.allowUnattendedRuntime && (isAuthorizedImplementation || isAuthorizedPlanning);
             if (!approvedRuntime) return false;
           }
           const convId = typeof evt.conversation_id === 'string' ? evt.conversation_id : null;
@@ -1011,8 +1016,26 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     if(proc.aborted)return await fail('Run canceled by Paperclip');
     if(proc.stdoutTruncated || proc.malformed)return await fail('Antigravity output exceeded limit or included invalid NDJSON');
     if(logTruncated)return await fail('Paperclip task transcript hit its configured size limit; execution is not fully auditable');
-    if(proc.reason)return await fail(`Antigravity execution failed: ${proc.reason}`);
-    if(permissionFailure || looksLikePermissionDenial(proc.stderr))return await fail('Antigravity denied a tool permission; run is not complete');
+    if(classification) {
+      return await fail(classification.message, classification.clearSession, {
+        errorCode: classification.errorCode,
+        errorFamily: classification.errorFamily,
+      });
+    }
+    if(proc.reason) {
+      const isPerm = /permission/i.test(proc.reason);
+      const isInactivity = /inactivity/i.test(proc.reason);
+      return await fail(`Antigravity execution failed: ${proc.reason}`, false, {
+        errorCode: isPerm ? 'permission_denied' : (isInactivity ? 'antigravity_output_inactivity_monitor' : 'adapter_failed'),
+        errorFamily: isPerm ? 'permission' : (isInactivity ? 'execution' : undefined),
+      });
+    }
+    if(permissionFailure || looksLikePermissionDenial(proc.stderr)) {
+      return await fail('Antigravity denied a tool permission; run is not complete', false, {
+        errorCode: 'permission_denied',
+        errorFamily: 'permission',
+      });
+    }
     if(proc.code!==0) {
       if (classification) {
         let msg = classification.message;

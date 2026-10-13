@@ -45,6 +45,7 @@ test('project authorization validates operator configuration and cannot enable f
 
 test('explicit unattended policy applies only in the approved verified project; default still rejects auto tools', async t => {
   const { ctx, cfg } = await setup(t);
+  cfg.allowUnattendedRuntime = false;
   ctx.context.taskTitle = 'SCENARIO_AUTO_APPROVE';
   assert.match((await executeWithHelpers(ctx, helpers, testDeps)).errorMessage, /permission policy is unsafe/);
   cfg.allowUnattendedRuntime = true;
