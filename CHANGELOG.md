@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.0 — Completion-driven execution
+
+- Introduce completion-driven execution as the default policy, including for saved legacy timeout values. Explicit bounded execution requires timeoutPolicy=bounded and a positive timeoutSec.
+- Disable AGY auto-finalization deadlines; one adapter-owned timer enforces explicitly bounded execution. Zero has no process kill timer.
+- Preserve interrupted task conversations and usage baselines for authorized continuation.
+- Require acceptance evidence and completed background checks in task instructions; distinguish successful turns from completed issues.
+
 ## 0.5.5 — Accurate tool failures and ambiguous provider results
 
 - Close ERROR and canceled/interrupted tool updates at their reported duration and preserve the actual error instead of leaving a tool active until process exit.

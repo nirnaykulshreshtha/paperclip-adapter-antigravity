@@ -52,6 +52,10 @@ export function normalizeConfig(raw = {}) {
     throw new Error('Project implementation authorization requires Paperclip isolated workspaces');
   }
   const promptPolicy = text(raw.promptPolicy, 'compact_resume');
+  const timeoutPolicy = text(raw.timeoutPolicy, 'completion');
+  if(!['completion','bounded'].includes(timeoutPolicy)) throw new Error('timeoutPolicy must be completion or bounded');
+  const configuredTimeoutSec=int(raw.timeoutSec,0,0,3600);
+  if(timeoutPolicy==='bounded' && configuredTimeoutSec===0) throw new Error('Bounded execution requires a positive timeoutSec');
   if (!['compact_resume', 'full_every_turn'].includes(promptPolicy)) {
     throw new Error('promptPolicy must be compact_resume or full_every_turn');
   }
@@ -74,7 +78,8 @@ export function normalizeConfig(raw = {}) {
     enableAccountRotation: false,
     validateSelectedModelOnRun: raw.validateSelectedModelOnRun !== false,
     accountPoolFile: accountPoolFile || null,
-    timeoutSec: int(raw.timeoutSec, 300, 30, 3600),
+    timeoutPolicy,
+    timeoutSec: timeoutPolicy==='bounded' ? configuredTimeoutSec : 0,
     outputInactivityTimeoutMs: raw.outputInactivityTimeoutMs === null ? null : raw.outputInactivityTimeoutMs === undefined ? undefined : int(raw.outputInactivityTimeoutMs, undefined, 1, 86400000),
     probeAuthentication: raw.probeAuthentication !== false,
     probeTimeoutSec: int(raw.probeTimeoutSec, 35, 10, 120),
@@ -107,7 +112,8 @@ export const configSchema = {
     { key: 'effort', label: 'Reasoning effort', type: 'select', options: [{label:'CLI default',value:''},{label:'Low',value:'low'},{label:'Medium',value:'medium'},{label:'High',value:'high'}] },
     { key: 'investigationBudget', label: 'Initial investigation tool-call budget', type: 'number', default: 12, hint: 'Prompt guidance only; never kills tools or skips required checks' },
     { key: 'outputInactivityTimeoutMs', label: 'Output inactivity timeout (milliseconds)', type: 'number', hint: 'Positive integer; null disables this monitor. The overall run timeout still applies.' },
-    { key: 'timeoutSec', label: 'Timeout (seconds)', type: 'number', default: 300 },
+    { key: 'timeoutPolicy', label: 'Execution deadline policy', type: 'select', default: 'completion', options: [{label:'Completion driven',value:'completion'},{label:'Explicit wall-clock limit',value:'bounded'}], hint:'Completion driven ignores legacy timeoutSec values. Paperclip owns issue disposition and continuation.' },
+    { key: 'timeoutSec', label: 'Wall-clock limit for bounded execution (seconds)', type: 'number', default: 0, hint: 'Applies only when timeoutPolicy is bounded. The adapter alone owns this deadline.' },
     { key: 'graceSec', label: 'Cancellation grace (seconds)', type: 'number', default: 10 },
     { key: 'validateSelectedModelOnRun', label: 'Validate model against live AGY models before execution', type: 'toggle', default: true },
     { key: 'accountPoolFile', label: 'Observed account state file (optional)', type: 'text', hint: 'Does not store or switch credentials' },

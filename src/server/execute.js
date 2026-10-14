@@ -2,13 +2,13 @@ import { realpath, access, symlink, readFile } from 'node:fs/promises';
 import { createJournal } from '../lib/journal.js';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { normalizeConfig } from '../lib/config.js';
+import { normalizeConfig } from '../lib/config.js?v=0.6.0-completion';
 import { validateWorkspace, worktreeStatus, checkBranchFreshness, readInstructions } from '../lib/workspace.js';
 import { resolveAssignedWorkspace } from '../lib/assigned-workspace.js';
 import { stageAssignedSkills, selectedSkillEntries } from '../lib/skills.js';
 import { preparePromptBundle } from '../lib/prompt-bundle-cache.js';
 import { copyBackAntigravityAuth, resolveAntigravityHostAuthPath, resolveAntigravityAuthCacheEntryPath } from '../lib/auth-cache.js';
-import { runAgy } from '../lib/process.js';
+import { runAgy } from '../lib/process.js?v=0.6.0-completion';
 import { errorText, looksLikePermissionDenial, sessionIdFrom, usageOf, isObj } from '../lib/result.js';
 import { usageSince } from '../lib/usage.js';
 import { estimateAgyCost } from '../lib/agy-pricing.js';
@@ -23,6 +23,7 @@ import { loadAccountPool, syncKeychainToPool, markAccountQuotaExhausted, parseQu
 
 const safeText=(v,max=5000)=>typeof v==='string'?v.slice(0,max):'';
 const maybeStr=(v)=>typeof v==='string'?v:'';
+const executionTimeoutResult=cfg=>cfg ? {adapterExecutionTimeout:{timeoutSec:cfg.timeoutSec,source:cfg.timeoutSec>0?'configured':'unlimited'}} : {};
 
 export function sha256Digest(str) {
   return 'sha256:' + createHash('sha256').update(str || '').digest('hex');
@@ -213,6 +214,7 @@ export function buildPrompt(ctx, cfg, instr, helpers, skillIndex = '', options =
     const messages = [
       '## Continue assigned Paperclip task',
       'Resume the existing conversation and its approved instructions. Do not restart completed investigation or repeat already reported work. Check current worktree state and the latest task changes before acting. Keep permission, review and release gates unchanged.',
+      'Completion requires evidence for every acceptance criterion. Wait for required background checks to finish and inspect their exit status and relevant output. A successful turn or elapsed time is not task completion. Record done only when no required work remains; otherwise record the actual review, blocker or continuation path in Paperclip.',
       `Task ID: ${safeText(context.taskId ?? context.issueId ?? ctx.runtime?.taskKey ?? '', 128)}`,
     ];
     if (recoveryContext) messages.push(recoveryContext);
@@ -289,6 +291,8 @@ export function buildPrompt(ctx, cfg, instr, helpers, skillIndex = '', options =
     `- Start by checking the assigned acceptance gaps against existing implementation and the upstream handoff. Keep a short record of files already read and verified results; reuse it within this conversation.\n` +
     `- Read targeted file ranges and batch independent reads. Reread a file or rerun a test only after relevant changes, a failure to diagnose, or a specific missing fact. Do not repeat broad repository discovery on every child task.\n` +
     `- Run focused tests for the touched scope first. Reserve full feature regression for integration/QA gates or changes that cross those boundaries. Preserve required acceptance checks; report unavailable external evidence as a precise blocker instead of repeatedly researching it.\n` +
+    `- Completion is evidence-based, not time-based. Track every acceptance criterion as verified, blocked or unverified. Wait for required background commands to finish and inspect their exit status and full relevant output before claiming tests passed. Starting a command, creating a test, provider success or elapsed time does not prove the task complete.\n` +
+    `- Mark the issue done only after all required acceptance checks have evidence and no follow-up remains. Use in_review for required review/approval and blocked for a concrete unmet dependency. If the turn ends with remaining work, preserve a precise progress handoff for Paperclip continuation; do not invent a successful disposition.\n` +
     `- Initial investigation budget: ${cfg.investigationBudget ?? 12} tool calls. Then produce a scoped change, a concrete verification result, or a precise blocker. Further investigation must name the unresolved question; do not restart discovery. This is guidance, not permission to skip required checks.\n` +
     `- Delivery Lead coordinates assignments; Technical Architect owns shared interface contracts; specialists own assigned implementation scopes.\n` +
     `- Children of one feature umbrella share its designated integration workspace/branch and parent issue as the source of decisions, contracts and handoffs. Read the parent and completed sibling handoffs before starting. Separate task conversations remain task-scoped.\n` +
@@ -389,6 +393,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
         resultJson: {
           status: 'SUCCESS',
           conversationContinuation: 'continue_conversation_v1',
+        ...executionTimeoutResult(cfg),
           response: idleMessage,
           conversation_id: null,
         },
@@ -536,7 +541,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     });
     const buildArgs = (modelToUse, resumeConvId) => {
       const a = ['--input-format', 'stream-json', '--output-format', 'stream-json', '--sandbox',
-        '--print-timeout', `${cfg.timeoutSec}s`];
+        '--print-timeout', '0'];
       // The CLI has no "default" mode value. Omit the override for normal
       // implementation; planning explicitly selects the supported plan mode.
       if (cfg.executionMode === 'planning') a.push('--mode=plan');
@@ -1066,7 +1071,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     const fail=async(message,clearSession=false,extra={})=>{
       const finalId=typeof proc.final?.conversation_id==='string' && /^[\w-]{5,200}$/.test(proc.final.conversation_id) ? proc.final.conversation_id : null;
       const retainedId=finalId || observedConversationId;
-      const keepSession=Boolean(retainedId && (extra.errorCode==='provider_result_inconsistent' || extra.errorFamily==='provider_quota' || ((accountChanged || previous?.resumeRequired) && extra.errorFamily==='session')));
+      const keepSession=Boolean(retainedId && (proc.timedOut || proc.inactivityTimedOut || proc.aborted || extra.errorCode==='provider_result_inconsistent' || extra.errorFamily==='provider_quota' || ((accountChanged || previous?.resumeRequired) && extra.errorFamily==='session')));
       let retainedUsageTotals=canResume ? previous.usageTotals ?? null : null;
       if(keepSession && proc.final?.usage) {
         try {retainedUsageTotals=usageSince(proc.final.usage,retainedUsageTotals,{isResume:canResume}).usageTotals;}
@@ -1111,6 +1116,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       ...extra,
       resultJson: {
         conversationContinuation: 'continue_conversation_v1',
+        ...executionTimeoutResult(cfg),
         efficiency: efficiency.snapshot(),
         ...(extra.errorFamily ? { errorFamily: extra.errorFamily } : {}),
         ...(isObj(extra.resultJson) ? extra.resultJson : {}),
@@ -1262,6 +1268,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       resultJson: {
         status: 'SUCCESS',
         conversationContinuation: 'continue_conversation_v1',
+        ...executionTimeoutResult(cfg),
         response: safeText(proc.final.response, 20000),
         conversation_id: id,
         account: currentAccountEmail,
@@ -1287,6 +1294,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       ...(!spawned?{executionRecovery:{kind:'bootstrap',providerWorkStarted:false}}:{}),
       resultJson: {
         conversationContinuation: 'continue_conversation_v1',
+        ...executionTimeoutResult(cfg),
       },
     };
   } finally {

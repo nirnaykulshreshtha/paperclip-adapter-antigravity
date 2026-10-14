@@ -100,7 +100,7 @@ process.stdin.on('end',()=>{
 });
 `);
   await chmod(exe,0o755);
-  const config={command:exe,cwd:secondary,allowedWorkspaceRoot:secondary,executionMode:'planning',model:'gemini-3.8-flash-low',timeoutSec:30,accountPoolFile:mockPoolFile,validateSelectedModelOnRun:true,traceDirectory:path.join(root,'traces')};
+  const config={command:exe,cwd:secondary,allowedWorkspaceRoot:secondary,executionMode:'planning',model:'gemini-3.8-flash-low',timeoutPolicy:'bounded',timeoutSec:30,accountPoolFile:mockPoolFile,validateSelectedModelOnRun:true,traceDirectory:path.join(root,'traces')};
   return {root,primary,secondary,exe,config,mockPoolFile};
 }
 export function fakeContext(config, taskTitle='SCENARIO_OK') {

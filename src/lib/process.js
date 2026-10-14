@@ -101,7 +101,7 @@ export async function runAgy({ command, args, cwd, env, prompt, timeoutMs, grace
       proc.stdin.end(message);
     });
     signal?.addEventListener('abort',abort,{once:true});
-    timeoutId=setTimeout(()=>{timedOut=true;requestStop('SIGTERM');},timeoutMs);
+    if(timeoutMs>0) timeoutId=setTimeout(()=>{timedOut=true;requestStop('SIGTERM');},timeoutMs);
     const processLine=(line)=>{
       if(!line.trim())return;
       try{

@@ -46,6 +46,7 @@ export function buildAntigravityLocalConfig(v = {}) {
   }
 
   // Operational timeouts and safety policies
+  if (v.timeoutPolicy) ac.timeoutPolicy = v.timeoutPolicy;
   if (typeof v.timeoutSec === 'number') ac.timeoutSec = v.timeoutSec;
   if (typeof v.investigationBudget === 'number') ac.investigationBudget = v.investigationBudget;
   if (v.outputInactivityTimeoutMs === null) {

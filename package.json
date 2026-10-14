@@ -1,6 +1,6 @@
 {
   "name": "paperclip-adapter-antigravity",
-  "version": "0.5.5",
+  "version": "0.6.0",
   "description": "Native Paperclip Antigravity CLI adapter with live models, observed account/quota sync, session-safe execution, audited transcripts and verified model-rate cost estimates",
   "type": "module",
   "author": "Nirnay Kulshreshtha <nirnaykulshreshtha@gmail.com>",

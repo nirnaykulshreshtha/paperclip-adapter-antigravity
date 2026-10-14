@@ -126,3 +126,11 @@ node scripts/trace-report.mjs /path/to/trace.jsonl ./run-history.html
 
 The report contains potentially sensitive prompts, file contents, and tool output. Keep it private. A 32 MiB cap per trace prevents unbounded storage; `journal.truncated` marks when the cap is reached. Older traces require periodic deletion or a separate retention policy. Runtime Paperclip UI rendering is host-controlled; the built-in offline viewer provides a complete view of captured events even if the host activity panel doesn't display them.
 
+
+### Completion and runtime limits
+
+`timeoutPolicy` defaults to `completion`: no wall-clock kill timer, including for agents with a saved legacy `timeoutSec: 900`. Select `timeoutPolicy: bounded` and a positive `timeoutSec` to opt into a wall-clock operational limit. This is a behavior change in 0.6.0. AGY always receives `--print-timeout 0`; the adapter is the sole owner of an explicitly bounded deadline, avoiding competing termination/final-response timers. Output-inactivity monitoring, cancellation, permission checks and approval gates remain independent; their termination is not evidence of completed work. Timeout and cancellation retain a CLI-observed task/workspace conversation when available, so later authorized continuation can verify earlier outcomes and finish remaining work.
+
+A successful AGY turn is run-level success, not proof that the issue's acceptance criteria passed. Agent instructions require an evidence record for each criterion, completed and inspected background checks, and a correct Paperclip issue disposition: `done` only when no work remains, `in_review` for review/approval, or `blocked` for a concrete dependency. Paperclip owns subsequent continuation and task status; the adapter does not silently mark issues done or run its own retry loop. Unstructured provider prose cannot independently certify arbitrary acceptance criteria.
+
+See [the completion contract](docs/COMPLETION_CONTRACT.md) for runtime policy, host authority, migration behavior and verification limits.
