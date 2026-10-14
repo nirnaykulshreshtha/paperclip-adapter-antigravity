@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.5 — Accurate tool failures and ambiguous provider results
+
+- Close ERROR and canceled/interrupted tool updates at their reported duration and preserve the actual error instead of leaving a tool active until process exit.
+- Treat a quota-bearing ERROR result after a resumed quota conversation as inconsistent when AGY exits zero, emits a response and provides no current-turn provider error or stderr. Retain the conversation, but do not infer success or mark a fresh quota cooldown.
+
 ## 0.5.4 — Verified account recovery release
 
 - Package account handoff, quota continuation and verified model-rate pricing changes with refreshed runtime import versions.

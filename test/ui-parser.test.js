@@ -152,3 +152,11 @@ test('ui parser falls back cleanly to stdout for unstructured logs', () => {
   assert.equal(entries[0].kind, 'stdout');
   assert.equal(entries[0].text, plain);
 });
+
+test('raw ERROR tool updates render the actual error and duration',()=>{
+ const entries=parseStdoutLine(JSON.stringify({step_type:'tool',state:'ERROR',step_index:137,tool_name:'view_file',duration_seconds:0.126028,tool_info:{error:{message:'no such file or directory'}}}),'2026-10-14T09:38:32.564Z');
+ assert.equal(entries[0].kind,'tool_result');
+ assert.equal(entries[0].isError,true);
+ assert.equal(entries[0].durationMs,126);
+ assert.match(entries[0].content,/no such file or directory/);
+});

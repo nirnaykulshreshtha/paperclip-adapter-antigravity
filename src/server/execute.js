@@ -165,10 +165,10 @@ export function formatToolProgress(s) {
     const trimmed = target ? ` ${target.trim().replace(/\s+/g, ' ').slice(0, 160)}` : '';
     return `\n[tool:${name}]${trimmed}\n`;
   }
-  if (s.state === 'DONE') {
+  if (['DONE','ERROR','CANCELED','CANCELLED','INTERRUPTED'].includes(s.state)) {
     const dur = typeof s.duration_seconds === 'number' ? ` (${s.duration_seconds.toFixed(2)}s)` : '';
-    if (s.tool_info?.error) {
-      const errMsg = s.tool_info.error?.message || String(s.tool_info.error);
+    if (s.state!=='DONE' || s.tool_info?.error) {
+      const errMsg = s.tool_info?.error?.message || (s.tool_info?.error ? String(s.tool_info.error) : `Tool reported ${s.state}`);
       return `[tool:${name} error]${dur} ${errMsg.slice(0, 200)}\n`;
     }
     let snippet = '';
@@ -600,6 +600,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     await emitAcpx({type:'acpx.status',text:`AGY account: ${currentAccountEmail || 'unverified'} · Model: ${cfg.model}`});
 
     let quotaObservedAt=null;
+    let currentTurnProviderError=false;
     const classifyError = (p) => {
       const combined = `${p?.stderr || ''}\n${p?.reason || ''}\n${p?.final?.error || ''}`;
       const isAuth = /(?:not\s+logged\s+into|not\s+logged\s+in|login\s+required|run\s+`?agy\s+auth(?:\s+login)?`?\s+first|please\s+authenticate|token\s+source|unauthenticated|unauthorized|invalid\s+credentials|api[_ ]?key\s+(?:required|missing|invalid)|auth(?:entication)?\s+required)/i.test(combined);
@@ -607,6 +608,13 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
                       (p?.code === 3 && /quota|rate\s*limit|limit|exhaust/i.test(combined)));
       const isSessionLost = /conversation.*(?:not\s+found|invalid|expired)|unknown\s+session|cannot\s+resume|failed\s+to\s+resume/i.test(combined);
       const isTurnLimit = p?.code === 53 || /(?:turn_limit|max_turns)/i.test(combined);
+
+      if(isQuota && canResume && previous?.resumeRequired && p?.code===0 &&
+        p?.final?.status==='ERROR' && p.final.response?.trim() && !p.stderr?.trim() && !currentTurnProviderError) {
+        return {errorCode:'provider_result_inconsistent',errorFamily:'execution',clearSession:false,
+          message:'AGY exited successfully and emitted a response, but its resumed conversation result contains a quota error without a current-turn provider error. Quota attribution may be stale; inspect the raw result before retrying.',
+          resultJson:{providerResult:{status:p.final.status,error:p.final.error,quotaAttribution:'unverified'}}};
+      }
 
       if (isTurnLimit) {
         return {
@@ -715,6 +723,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
         if(evt.event==='result' && /quota|RESOURCE_EXHAUSTED/i.test(String(evt.result?.error || '')))
           quotaObservedAt ??= Date.now();
         await trace('cli.event',evt);
+        if(evt.event==='step_update' && evt.step_update?.step_type==='error_message') currentTurnProviderError=true;
         if(evt.event==='init') {
           if (evt.init?.permission_mode==='always-proceed') {
             const issueId = maybeStr(ctx.context?.issueId) || maybeStr(ctx.context?.taskId) || maybeStr(taskContext(ctx.context).taskId);
@@ -895,14 +904,14 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
                 text: target || toolName,
                 input: p,
               });
-            } else if(s.state==='DONE') {
+            } else if(['DONE','ERROR','CANCELED','CANCELLED','INTERRUPTED'].includes(s.state)) {
               const saved = activeToolCalls.get(callId) || {};
               activeToolCalls.delete(callId);
               const finalParams = Object.keys(p).length > 0 ? p : (saved.parameters || {});
               const finalTarget = target || saved.target || extractToolTarget(toolName, finalParams);
 
-              const isError = Boolean(s.tool_info?.error);
-              const errText = s.tool_info?.error?.message || (isError ? String(s.tool_info.error) : '');
+              const isError = s.state!=='DONE' || Boolean(s.tool_info?.error);
+              const errText = s.tool_info?.error?.message || (s.tool_info?.error ? String(s.tool_info.error) : isError ? `Tool reported ${s.state}` : '');
               const outputText = extractToolOutput(s);
               const duration = typeof s.duration_seconds === 'number'
                 ? s.duration_seconds
@@ -1057,7 +1066,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     const fail=async(message,clearSession=false,extra={})=>{
       const finalId=typeof proc.final?.conversation_id==='string' && /^[\w-]{5,200}$/.test(proc.final.conversation_id) ? proc.final.conversation_id : null;
       const retainedId=finalId || observedConversationId;
-      const keepSession=Boolean(retainedId && (extra.errorFamily==='provider_quota' || ((accountChanged || previous?.resumeRequired) && extra.errorFamily==='session')));
+      const keepSession=Boolean(retainedId && (extra.errorCode==='provider_result_inconsistent' || extra.errorFamily==='provider_quota' || ((accountChanged || previous?.resumeRequired) && extra.errorFamily==='session')));
       let retainedUsageTotals=canResume ? previous.usageTotals ?? null : null;
       if(keepSession && proc.final?.usage) {
         try {retainedUsageTotals=usageSince(proc.final.usage,retainedUsageTotals,{isResume:canResume}).usageTotals;}

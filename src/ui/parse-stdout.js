@@ -184,8 +184,8 @@ export function parseStdoutLine(line, ts) {
         }];
       }
 
-      if (parsed.state === 'DONE') {
-        const isError = Boolean(parsed.tool_info?.error);
+      if (['DONE', 'ERROR', 'CANCELED', 'CANCELLED', 'INTERRUPTED'].includes(parsed.state)) {
+        const isError = parsed.state !== 'DONE' || Boolean(parsed.tool_info?.error);
         const out = parsed.tool_info?.output ?? parsed.tool_info?.error?.message ?? parsed.tool_info?.error;
         return [{
           kind: 'tool_result',

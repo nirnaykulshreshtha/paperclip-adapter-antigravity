@@ -87,10 +87,16 @@ process.stdin.on('end',()=>{
  }
  const conversationId=process.argv.includes('--conversation')?process.argv[process.argv.indexOf('--conversation')+1]:'abcde-123';
  console.log(JSON.stringify({event:'init',conversation_id:conversationId,init:{permission_mode:scenario==='AUTO_APPROVE'?'always-proceed':'request-review'}}));
+ if(scenario==='TOOL_ERROR'){
+   console.log(JSON.stringify({event:'step_update',step_update:{step_type:'tool',state:'ACTIVE',step_index:137,tool_name:'view_file',tool_info:{parameters:{AbsolutePath:'/missing/otp.prisma'}}}}));
+   console.log(JSON.stringify({event:'step_update',step_update:{step_type:'tool',state:'ERROR',step_index:137,tool_name:'view_file',duration_seconds:0.126028,tool_info:{error:{type:'TOOL_ERROR',message:'no such file or directory'}}}}));
+ }
+ if(scenario==='CURRENT_QUOTA')console.log(JSON.stringify({event:'step_update',step_update:{step_type:'error_message',state:'DONE',step_index:138}}));
  console.log(JSON.stringify({event:'step_update',step_update:{step_type:'agent_response',state:'DONE',text_delta:'done'}}));
  if(scenario==='SOFT_DENY')console.error('Tool permission denied by policy');
- const status=scenario==='ERROR'?'ERROR':'SUCCESS';
- console.log(JSON.stringify({event:'result',result:{status,conversation_id:conversationId,response:status==='SUCCESS'?'done':'',error:status==='ERROR'?'mock failure':undefined,usage:{input_tokens:123,output_tokens:conversationId==='quota-progress-123'?14:4,cache_read_tokens:30}}}));
+ const quotaResult=['STALE_QUOTA','CURRENT_QUOTA'].includes(scenario);
+ const status=scenario==='ERROR'||quotaResult?'ERROR':'SUCCESS';
+ console.log(JSON.stringify({event:'result',result:{status,conversation_id:conversationId,response:status==='SUCCESS'||quotaResult?'done':'',error:quotaResult?'Individual quota reached. Resets in 103h58m14s.':status==='ERROR'?'mock failure':undefined,usage:{input_tokens:123,output_tokens:conversationId==='quota-progress-123'?14:4,cache_read_tokens:30}}}));
 });
 `);
   await chmod(exe,0o755);

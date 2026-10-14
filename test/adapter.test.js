@@ -374,3 +374,33 @@ test('individual model quota exhaustion segregates model cooldown and leaves gem
   assert.equal(claudeCandidate, null);
 });
 
+
+test('ERROR tools close at their actual duration and retain the missing-file error',async t=>{
+ const f=await fixture(t);const {ctx}=fakeContext(f.config,'SCENARIO_TOOL_ERROR');
+ const events=[];ctx.onEvent=async e=>events.push(e);
+ const result=await executeWithHelpers(ctx,helpers,testDeps);
+ assert.equal(result.exitCode,0,JSON.stringify(result));
+ const done=events.find(e=>e.eventType==='tool.execution.completed' && e.payload.executionId==='tool-137');
+ assert.equal(done.payload.status,'failed');
+ assert.equal(done.payload.durationMs,126);
+ assert.match(done.payload.error,/no such file or directory/);
+ assert.equal(result.resultJson.efficiency.failedToolCalls,1);
+});
+
+test('contradictory resumed quota result is unverified while a current provider error still reports quota',async t=>{
+ const f=await fixture(t);f.config.promptPolicy='full_every_turn';
+ process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD=makeMockToken('account@example.com');
+ const {ctx}=fakeContext(f.config);
+ const first=await executeWithHelpers(ctx,helpers,testDeps);
+ ctx.runtime.sessionParams={...first.sessionParams,resumeRequired:true};
+ ctx.context.taskTitle='SCENARIO_STALE_QUOTA';
+ const stale=await executeWithHelpers(ctx,helpers,testDeps);
+ assert.equal(stale.errorCode,'provider_result_inconsistent');
+ assert.equal(stale.clearSession,false);
+ assert.equal(stale.sessionParams.conversationId,first.sessionParams.conversationId);
+ assert.equal(stale.resultJson.quota,undefined);
+ assert.equal(stale.resultJson.providerResult.quotaAttribution,'unverified');
+ ctx.context.taskTitle='SCENARIO_CURRENT_QUOTA';
+ const current=await executeWithHelpers(ctx,helpers,testDeps);
+ assert.equal(current.errorCode,'provider_quota');
+});
