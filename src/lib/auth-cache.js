@@ -106,7 +106,7 @@ export async function writeAntigravityAuthCacheEntry({
       if (fd) await fd.close().catch(() => {});
       await rm(tmp, { force: true }).catch(() => {});
     }
-  }, { env });
+  }, env);
 }
 
 /**
@@ -259,7 +259,7 @@ export async function copyBackAntigravityAuth(input) {
       if (fd) await fd.close().catch(() => {});
       await rm(stagedTempPath, { force: true }).catch(() => {});
     }
-  }, { env });
+  }, env);
 
   if (resolveCacheEntryPath && isAntigravityAuthCacheEnabled(env)) {
     try {

@@ -13,6 +13,7 @@ import { errorText, looksLikePermissionDenial, sessionIdFrom, usageOf, isObj } f
 import { usageSince } from '../lib/usage.js';
 import { taskContext, dependencySummary } from '../lib/task-context.js';
 import { createEfficiencyTracker } from '../lib/efficiency.js';
+import { acquireWorkspaceLease } from '../lib/workspace-lease.js';
 import { discoverAgyModels } from '../lib/models.js';
 import { detectActiveAccount, detectHeadlessKeychainAccount } from '../lib/account.js';
 import { readObservedStatus } from '../lib/statusline.js';
@@ -324,11 +325,15 @@ export function sanitizeTelemetry(value, authToken, depth=0) {
  * this never modifies Paperclip's exported execute(ctx) entry point.
  */
 export async function executeWithHelpers(ctx, helpers, { discoverModels = discoverAgyModels } = {}) {
+  ctx={...ctx,config:ctx.config ?? ctx.adapterConfig ?? ctx.agent?.adapterConfig ?? {}};
   let spawned=false;
   let stagedSkills=null;
   let journal=null;
   let terminalWritten=false;
   let cfg=null;
+  let workspaceLease=null;
+  let leaseDispatched=false;
+  let providerStopped=false;
   const startedAt=performance.now();
   let cliStartedAt=null;
   let spawnedAfterMs=null;
@@ -396,6 +401,10 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       if (!issueId || (!cfg.approvedIssueIds.includes(issueId) && !cfg.approvedProjectIds.includes(workspace.projectId))) {
         throw new Error('Implementation blocked: current issue has no explicit issue or isolated project implementation authorization');
       }
+    }
+    if (cfg.executionMode === 'implementation') {
+      phase='workspace_lease'; await trace('phase.started');
+      workspaceLease=await acquireWorkspaceLease(cwd,{runId:ctx.runId,signal:ctx.signal});
     }
     if(cfg.executionMode==='planning' && (await worktreeStatus(cwd)).length) {
       throw new Error('Planning requires a clean worktree (except the opt-in sentinel)');
@@ -645,6 +654,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     phase='cli_execution'; await trace('phase.started',{model:cfg.model,promptMode,promptBytes:Buffer.byteLength(prompt)});
     cliStartedAt=performance.now();
     // The CLI owns account selection. Never re-run side-effectful turns under a different account.
+      if (workspaceLease) { await workspaceLease.markDispatch(); leaseDispatched=true; }
       proc = await runAgy({
         command: cfg.command,
         args: runArgs,
@@ -656,6 +666,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       signal:ctx.signal,
       onSpawn:async(meta)=>{
         spawned=true;
+        if (workspaceLease) await workspaceLease.markSpawn(meta.pid,meta.processGroupId);
         spawnedAfterMs=Math.round(performance.now()-startedAt);
         await trace('process.spawn',{...meta,preflightMs:spawnedAfterMs});
         await ctx.onSpawn?.(meta);
@@ -990,6 +1001,8 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       onStderr: async (text) => { await trace('cli.stderr',{text}); if (looksLikePermissionDenial(text)) permissionFailure = true; },
     });
 
+    providerStopped=true;
+    if (workspaceLease) await workspaceLease.assertStopped();
     phase='finalization'; await trace('phase.started');
     const runtimeDurationMs=cliStartedAt===null?null:Math.round(performance.now()-cliStartedAt);
     const performancePayload={
@@ -1018,6 +1031,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     }
   const classification = classifyError(proc);
     const fail=async(message,clearSession=false,extra={})=>{
+      const keepSession=extra.errorFamily==='provider_quota' && canResume && previous?.promptSignature===promptSignature && Boolean(previous?.contextFingerprint) && Boolean(currentAccountEmail) && previous.account===currentAccountEmail;
       await ctx.onRuntimeProgress?.({
         phase: 'finalize',
         message: `Execution failed: ${message}`.slice(0, 180),
@@ -1044,7 +1058,8 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       await terminal('failed',{message,code:proc.code,...extra});
       return {exitCode:proc.code===0?1:proc.code??1,signal:proc.signal??null,
       timedOut:proc.timedOut,errorMessage:message,
-      clearSession:clearSession || Boolean(canResume && (proc.code !== 0 || proc.final?.status !== 'SUCCESS')),
+      clearSession:keepSession ? false : clearSession || Boolean(canResume && (proc.code !== 0 || proc.final?.status !== 'SUCCESS')),
+      ...(keepSession ? {sessionParams:previous,sessionDisplayId:oldId} : {}),
       provider:'antigravity',biller:'antigravity',billingType:'unknown',model:cfg.model,costStatus:'unpriced',
       ...extra,
       resultJson: {
@@ -1215,14 +1230,19 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     await emitEvent({eventType:'harness.diagnostic',stream:'stderr',level:'error',message:safeText(message,300),payload:{phase,error:message}}).catch(()=>{});
     await terminal('failed',{message,phase}).catch(()=>{});
     return {exitCode:1,signal:null,timedOut:false,errorMessage:errorText(err),
+      ...(err.code==='workspace_busy'?{errorCode:'workspace_busy',errorMeta:{retryableBeforeDispatch:!spawned,requiresWorkspaceReconciliation:spawned}}:{}),
       ...(!spawned?{executionRecovery:{kind:'bootstrap',providerWorkStarted:false}}:{}),
       resultJson: {
         conversationContinuation: 'continue_conversation_v1',
       },
     };
   } finally {
-    if (stagedSkills) await stagedSkills.cleanup();
-    if (journal) await journal.close();
+    const cleanupWarning=async (name,err)=>{
+      const safe=sanitizeTelemetry({message:`${name} cleanup requires inspection: ${errorText(err)}`},ctx.authToken);
+      await ctx.onLog('stderr',safe.message+'\n').catch(()=>{});
+    };
+    if (stagedSkills) await stagedSkills.cleanup().catch(err=>cleanupWarning('Skills',err));
+    if (journal) await journal.close().catch(err=>cleanupWarning('Journal',err));
     const sandboxAuthPath = cfg?.sandboxAuthJsonPath || ctx?.sandboxAuthJsonPath || ctx?.context?.sandboxAuthJsonPath;
     if (sandboxAuthPath) {
       try {
@@ -1242,7 +1262,11 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
             resolveAntigravityAuthCacheEntryPath(process.env, accountId, ctx.agent?.companyId || 'default'),
           env: process.env,
         });
-      } catch {}
+      } catch (err) { await cleanupWarning('Credential copy-back',err); }
+    }
+    if (workspaceLease) {
+      try { await workspaceLease.release(!leaseDispatched || providerStopped); }
+      catch (err) { await ctx.onLog('stderr', `Workspace lease cleanup requires inspection: ${errorText(err)}\n`).catch(()=>{}); }
     }
   }
 }

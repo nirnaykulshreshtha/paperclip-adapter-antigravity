@@ -4,7 +4,7 @@ import {promisify} from 'node:util';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 process.env.NODE_ENV = 'test';
-export const FIXTURE_SUITE_VERSION = '0.4.2';
+export const FIXTURE_SUITE_VERSION = '0.5.0';
 const exec=promisify(execFile);
 
 export function makeMockToken(email) {

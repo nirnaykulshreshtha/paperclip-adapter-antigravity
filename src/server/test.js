@@ -75,7 +75,7 @@ export async function testEnvironment(ctx, { probe = probeWithCache, evaluateRea
           add('credential_readiness', 'info', `Antigravity credentials ready (${readiness.authMode} mode via ${readiness.source}).`);
         }
 
-        const probeResult = await probe({command:cfg.command,model:cfg.model,probeTimeoutSec:Number(cfg.probeTimeoutSec)});
+        const probeResult = await probe({command:cfg.command,model:cfg.model,probeTimeoutSec:Number(cfg.probeTimeoutSec),probeIdentity:readiness?.account ? JSON.stringify([ctx?.agent?.companyId || ctx?.companyId || 'default',readiness.source,readiness.account]) : null});
         if (probeResult.ok) {
           const u = probeResult.tokens ?? {};
           const usage = Number.isInteger(u.totalTokens)

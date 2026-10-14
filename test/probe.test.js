@@ -111,3 +111,14 @@ test('Paperclip lifecycle accepts only a successful authenticated hello probe', 
   });
   assert.equal(acceptedByHost(failed),false);
 });
+
+test('probe cache isolates company/account identity and never caches an unknown identity',async()=>{
+ clearProbeCacheForTests();let calls=0;
+ const runner=async()=>{calls++;return {stdout:JSON.stringify({status:'SUCCESS',response:'OK',usage:{input_tokens:1,output_tokens:1}}),stderr:''};};
+ const cfg={command:'/path/agy',model:'gemini-test',probeTimeoutSec:11,probeIdentity:'company-a/account-a'};
+ await probeWithCache(cfg,runner);await probeWithCache(cfg,runner);assert.equal(calls,1);
+ await probeWithCache({...cfg,probeIdentity:'company-b/account-a'},runner);assert.equal(calls,2);
+ await probeWithCache({...cfg,probeIdentity:'company-a/account-b'},runner);assert.equal(calls,3);
+ await probeWithCache({...cfg,probeIdentity:null},runner);await probeWithCache({...cfg,probeIdentity:null},runner);assert.equal(calls,5);
+ clearProbeCacheForTests();
+});

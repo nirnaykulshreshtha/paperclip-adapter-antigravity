@@ -18,7 +18,7 @@ export function createServerAdapter() {
     agentConfigurationDoc,sessionCodec,
     getConfigSchema:()=>configSchema,
     supportsInstructionsBundle:true,instructionsPathKey:'instructionsFilePath',
-    getRuntimeCommandSpec:config=>({command:typeof config.command==='string'?config.command:'agy'}),
+    getRuntimeCommandSpec:config=>({command:typeof config?.command==='string'?config.command:'agy'}),
     runtimeToolDelivery:'environment',
     resolveAuthPrecedence:resolveAntigravityAuthPrecedence,
     runDeviceLogin,

@@ -1,22 +1,24 @@
-> **Unofficial YourClientDesk efficiency patch for the supplied adapter v0.3.2.** This package adds compact prompt continuation and a Paperclip handoff protocol. See [docs/YOURCLIENTDESK_PAPERCLIP_OPTIMIZATION.md](docs/YOURCLIENTDESK_PAPERCLIP_OPTIMIZATION.md). This patch has not been tested with an authenticated AGY/Paperclip production installation. The upstream version number remains 0.3.2 for compatibility; do not mistake it for an upstream release.
+# Antigravity adapter for Paperclip — v0.5.0
 
-# Paperclip adapter — Antigravity CLI (0.3.0)
+A local external adapter using AGY stream-JSON and Paperclip's task, workspace, transcript, credential and configuration interfaces. Requires Node.js 24.11 or newer, matching the pinned Paperclip SDK. On macOS, model discovery also requires Python 3 for the PTY helper.
+
+This release hardens shared-workspace execution, quota-session continuity and account-isolated health checks. It does not provide a cloud execution backend or detached native-runner adoption. See [production readiness and adapter comparison](docs/PRODUCTION_READINESS.md) and the [execution efficiency audit](docs/OTP_EFFICIENCY_AUDIT.md). Fixture tests do not prove provider quota savings or replace an authenticated canary.
 
 A **native external Paperclip adapter**, updated from the supplied v0.2.12 archive. No separate HTTP bridge or UI service is required. Preserves the existing `antigravity_local` adapter type, Paperclip execution/workspace guardrails, skills staging, model APIs, and UI parser contract.
 
-## Changes from 0.2.12
+## Runtime behavior
 
-| Concern | v0.3 behavior |
+| Concern | Behavior |
 | --- | --- |
 | Terminal account changes | Optional AGY `/statusline` observer records whitelisted email/model/quota data; Paperclip picks this up on its next adapter query/run |
 | Model selection | Paperclip native `listModels` and `refreshModels` run **`agy models`**; model field uses a combobox, not a static catalog; selected ID is verified at run start by default |
-| Credentials | **No keychain writes or token copies**. Old JSON account-pool credentials are stripped on migration; switching AGY accounts is done in AGY itself |
+| Credentials | No keychain writes or automatic account switching. Explicit sandbox credential copy-back accepts only a strictly newer credential for the same subscription identity; registry snapshots contain no tokens |
 | Quota | Native `getQuotaWindows` uses the *fresh* interactive AGY quota snapshot, if available; otherwise reports unavailable |
 | Sessions | Resumption tied to task, canonical workspace, workspace ID, account and model; force fresh after detected account/model change |
 | Logs | Native Paperclip ACPX transcript (responses, tool calls/results, usage/checkpoints, real thinking deltas if emitted). Structured audit events go to Paperclip's `onEvent` |
 | Usage | Persist cumulative CLI counters and report **per-run delta** on resumed turns. Unknown baselines remain unknown |
 | Cost | No fraudulent Gemini/Claude dollar number from CLI subscription tokens; `costStatus: 'unpriced'`. `src/lib/pricing.js` remains available for independently metered provider responses |
-| Reliability | Atomic private state files, cross-process account-registry lock, corrupt-file errors, size limits, key redaction, command/workspace guards |
+| Reliability | Serialized implementation writers, durable provider ownership receipts, private state files, bounded streams, redaction, command/workspace guards |
 
 ## Requirements
 

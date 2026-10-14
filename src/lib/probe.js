@@ -76,13 +76,20 @@ export async function runMinimalProbe({command, model, timeoutSec=35}, runner=ex
 
 /** Deduplicate concurrent probes and cache only proven successes. */
 export async function probeWithCache(cfg, runner=exec, now=()=>Date.now()) {
-  const key=JSON.stringify([cfg.command,cfg.model,cfg.probeTimeoutSec]);
+  // Production callers explicitly pass null when credential identity is unknown.
+  // Never certify a different company/account using a cached model response.
+  if (cfg.probeIdentity === null || cfg.forceProbe === true) return runMinimalProbe({command:cfg.command,model:cfg.model,timeoutSec:cfg.probeTimeoutSec},runner);
+  for (const [key,entry] of successCache) if (now()-entry.at>=TTL_MS) successCache.delete(key);
+  const key=JSON.stringify([cfg.command,cfg.model,cfg.probeTimeoutSec,cfg.probeIdentity]);
   const cached=successCache.get(key);
   if (cached && now()-cached.at<TTL_MS) return {...cached.result,cached:true};
   if (inflight.has(key)) return inflight.get(key);
   const promise=runMinimalProbe({command:cfg.command,model:cfg.model,timeoutSec:cfg.probeTimeoutSec},runner)
     .then(result=>{
-      if(result.ok)successCache.set(key,{at:now(),result});
+      if(result.ok) {
+        if(successCache.size>=128) successCache.delete(successCache.keys().next().value);
+        successCache.set(key,{at:now(),result});
+      }
       return result;
     })
     .finally(()=>inflight.delete(key));

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0 — Local execution hardening
+
+- Serialize implementation writers with Paperclip's cross-process directory lock and retain provider ownership receipts across controller loss. Unknown dispatch or surviving CLI process groups block workspace reuse.
+- Preserve a verified same-account conversation on quota failure without automatic retry or account switching; unsafe or unverifiable sessions still clear.
+- Scope successful health-probe caching by company/account identity, bypass caching for unknown identity, and bound the cache size.
+- Accept host adapter-config fallback consistently, validate inactivity settings, and tolerate an omitted runtime-command configuration.
+- Align the Node engine with the SDK requirement (24.11+), add an offline CI template, and document the local/cloud/native-runner capability boundary.
+
 ## 0.4.3 — Shared feature execution and efficiency fixes
 
 - Deliver nested Paperclip assignments and detect requirement changes on resumed conversations.

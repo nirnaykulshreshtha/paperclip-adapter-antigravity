@@ -138,3 +138,25 @@ test('telemetry redacts run token and secret-key-shaped arguments',()=>{
  assert.equal(safe.payload.password,'[REDACTED]');
  assert.doesNotMatch(JSON.stringify(safe),/token-123|key-123|"pw"/);
 });
+
+test('quota preserves only a verified same-account continuation without replaying it',async t=>{
+ const f=await fixture(t);const {ctx,spawned}=fakeContext(f.config);
+ process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD=makeMockToken('same@example.com');
+ const first=await executeWithHelpers(ctx,helpers,testDeps);
+ assert.equal(first.exitCode,0,JSON.stringify(first));
+ ctx.runtime.sessionParams=first.sessionParams;ctx.context.taskTitle='SCENARIO_QUOTA';
+ const quota=await executeWithHelpers(ctx,helpers,testDeps);
+ assert.equal(quota.errorCode,'provider_quota');assert.equal(quota.clearSession,false);
+ assert.deepEqual(quota.sessionParams,first.sessionParams);
+ assert.equal(spawned.length,2,'only the two requested turns run; no automatic retry');
+ ctx.runtime.sessionParams={...first.sessionParams,promptSignature:null};
+ const legacy=await executeWithHelpers(ctx,helpers,testDeps);
+ assert.equal(legacy.clearSession,true,'unverifiable sessions still clear');
+});
+test('execution accepts host adapterConfig fallback and rejects invalid inactivity settings',async t=>{
+ const f=await fixture(t);const {ctx}=fakeContext(f.config);delete ctx.config;
+ const result=await executeWithHelpers(ctx,helpers,testDeps);assert.equal(result.exitCode,0,JSON.stringify(result));
+ for (const bad of [-1,NaN,Infinity,1.5,'invalid']) assert.throws(()=>normalizeConfig({...f.config,outputInactivityTimeoutMs:bad}));
+ assert.equal(normalizeConfig({...f.config,outputInactivityTimeoutMs:null}).outputInactivityTimeoutMs,null);
+ assert.doesNotThrow(()=>createServerAdapter().getRuntimeCommandSpec());
+});
