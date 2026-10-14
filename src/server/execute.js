@@ -533,7 +533,10 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     });
     const buildArgs = (modelToUse, resumeConvId) => {
       const a = ['--input-format', 'stream-json', '--output-format', 'stream-json', '--sandbox',
-        `--mode=${cfg.executionMode === 'planning' ? 'plan' : 'default'}`, '--print-timeout', `${cfg.timeoutSec}s`];
+        '--print-timeout', `${cfg.timeoutSec}s`];
+      // The CLI has no "default" mode value. Omit the override for normal
+      // implementation; planning explicitly selects the supported plan mode.
+      if (cfg.executionMode === 'planning') a.push('--mode=plan');
       a.push('--model', modelToUse);
       // Linked worktrees keep Git objects/indexes outside cwd. This path came
       // from Git and was verified against the explicitly trusted repository;

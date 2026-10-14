@@ -158,8 +158,10 @@ test('planning uses native agy plan mode; implementation is never accept-edits o
  ctx.onMeta=async m=>{args=m.commandArgs;};
  const implement=await executeWithHelpers(ctx, helpers, testDeps);
  assert.equal(implement.exitCode,0,JSON.stringify(implement));
- assert.ok(args.includes('--mode=default'));
+ assert.ok(!args.some(arg=>arg === '--mode' || arg.startsWith('--mode=')));
  assert.ok(!args.includes('--mode=accept-edits'));
+ assert.ok(args.includes('--sandbox'));
+ assert.ok(!args.includes('--dangerously-skip-permissions'));
 });
 
 test('rejects remote execution targets even with valid checkout',async t=>{

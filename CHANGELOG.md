@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.1 — Supported implementation CLI mode
+
+- Omit the implementation mode override: AGY supports `accept-edits`, `auto` and `plan`, not `default`. Preserve sandbox and implementation authorization.
+- Version the executor import so Paperclip's runtime adapter reload loads the corrected executor on an existing host.
+- Assert implementation never emits an unsupported mode or permission-bypass flag.
+
 ## 0.5.0 — Local execution hardening
 
 - Serialize implementation writers with Paperclip's cross-process directory lock and retain provider ownership receipts across controller loss. Unknown dispatch or surviving CLI process groups block workspace reuse.

@@ -1,5 +1,7 @@
 import { type, models, agentConfigurationDoc } from '../index.js';
-import { execute } from './execute.js';
+// Paperclip reloads this entry point with a query string; version the changed
+// executor too so an already running host does not retain the old ESM module.
+import { execute } from './execute.js?v=0.5.1';
 import { testEnvironment } from './test.js';
 import { sessionCodec } from '../lib/result.js';
 import { configSchema } from '../lib/config.js';

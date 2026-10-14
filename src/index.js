@@ -9,7 +9,7 @@ export const agentConfigurationDoc = `# Antigravity CLI — Paperclip workspace-
 - Add .paperclip-antigravity-allow with content ALLOW_PAPERCLIP_ANTIGRAVITY_LOCAL under allowedWorkspaceRoot ONCE. Paperclip must create worktrees; the adapter never does.
 - The adapter accepts Paperclip context.paperclipWorkspace.cwd only after checking path containment, Git repository identity, registration, and non-protected branch.
 - The primary checkout is always rejected for dynamic task execution.
-- Planning tasks pass --mode=plan and --sandbox. Implementation mode passes --mode=default, requires enableImplementation=true, a task ID and execution workspace ID.
+- Planning tasks pass --mode=plan and --sandbox. Implementation leaves the CLI mode override unset, retains --sandbox, and requires enableImplementation=true, a task ID and execution workspace ID.
 - Never use production credentials in agent worktrees. Terminal sandbox is not OS-level isolation. Permission denial is an error.
 - No agent may merge, deploy, execute production database migrations, or push automatically. Protect main using branch permissions and human review outside this adapter.
 - Sessions resume only for the same task, worktree, account, model and (if bound) workspace ID.
@@ -19,4 +19,4 @@ export const agentConfigurationDoc = `# Antigravity CLI — Paperclip workspace-
 - Provider thinking text cannot be reconstructed from thinking-token usage alone.
 - Dollar costs remain unpriced until trustworthy billing records are available.
 `;
-export { createServerAdapter } from './server/index.js';
+export { createServerAdapter } from './server/index.js?v=0.5.1';
