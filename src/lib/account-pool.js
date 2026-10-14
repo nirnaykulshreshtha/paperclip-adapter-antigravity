@@ -6,12 +6,13 @@ import { readFile, mkdir, open, rename, rm, stat } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import path from 'node:path';
-import { detectActiveAccount } from './account.js';
+import { detectActiveAccount } from './account.js?v=0.6.0-performance';
 
 export function getAccountPoolPath() {
   return path.resolve(process.env.PAPERCLIP_ANTIGRAVITY_ACCOUNT_POOL_FILE || path.join(homedir(), '.paperclip', 'antigravity-accounts.json'));
 }
 const blank = () => ({version:2,activeAccount:null,accounts:[]});
+const UNCHANGED = Symbol('unchanged account observation');
 function validate(data) {
   if (!data || typeof data !== 'object' || !Array.isArray(data.accounts)) throw new Error('Corrupt account registry');
   const accounts = data.accounts.map(a => {
@@ -69,7 +70,11 @@ export async function updateAccountPool(mutator,filePath=getAccountPoolPath(),{w
       await new Promise(resolve=>setTimeout(resolve,30));
     }
   }
-  try {const pool=await loadAccountPool(filePath);const value=await mutator(pool);await saveAccountPool(pool,filePath);return value??pool;}
+  try {
+    const pool=await loadAccountPool(filePath),value=await mutator(pool);
+    if(value!==UNCHANGED)await saveAccountPool(pool,filePath);
+    return value===UNCHANGED ? pool : value??pool;
+  }
   finally {await rm(lock,{recursive:true,force:true});}
 }
 export function parseQuotaResetDuration(value) {
@@ -78,17 +83,19 @@ export function parseQuotaResetDuration(value) {
   const seconds=match?Number(match[1]||0)*3600+Number(match[2]||0)*60+Number(match[3]||0):0;
   return Number.isSafeInteger(seconds) && seconds>0?Math.min(seconds*1000+30_000,31*86400000):30*60_000;
 }
-export async function syncKeychainToPool(pool,filePath=pool?._filePath || getAccountPoolPath()) {
-  const detected=await detectActiveAccount();
+export async function syncKeychainToPool(pool,filePath=pool?._filePath || getAccountPoolPath(),detectedObservation) {
+  const detected=detectedObservation === undefined ? await detectActiveAccount() : detectedObservation;
   if(!detected?.email)return pool;
   const email=detected.email.toLowerCase();
-  await updateAccountPool(p=>{
+  const result=await updateAccountPool(p=>{
     const a=p.accounts.find(x=>x.email.toLowerCase()===email);
+    const age = a ? Date.now()-Date.parse(a.lastSeenAt) : Infinity;
+    if(a && p.activeAccount===email && a.authSource===(detected.source||'keychain') && age>=0 && age<60_000) return UNCHANGED;
     if(a){a.lastSeenAt=new Date().toISOString();a.authSource=detected.source||'keychain';}
     else p.accounts.push({email,status:'observed',lastSeenAt:new Date().toISOString(),authSource:detected.source||'keychain',modelQuotas:{}});
     p.activeAccount=email;
   },filePath);
-  return loadAccountPool(filePath);
+  return result;
 }
 export function isAccountReadyForModel(account,model=null,now=Date.now()) {
   if(!account || ['disabled','invalid','blocked'].includes(account.status))return false;

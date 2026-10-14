@@ -1,25 +1,25 @@
 import { realpath, access, symlink, readFile } from 'node:fs/promises';
-import { createJournal } from '../lib/journal.js';
+import { createJournal } from '../lib/journal.js?v=0.6.0-performance';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { normalizeConfig } from '../lib/config.js?v=0.6.0-completion';
+import { normalizeConfig } from '../lib/config.js?v=0.6.0-performance';
 import { validateWorkspace, worktreeStatus, checkBranchFreshness, readInstructions } from '../lib/workspace.js';
 import { resolveAssignedWorkspace } from '../lib/assigned-workspace.js';
-import { stageAssignedSkills, selectedSkillEntries } from '../lib/skills.js';
-import { preparePromptBundle } from '../lib/prompt-bundle-cache.js';
+import { stageAssignedSkills } from '../lib/skills.js?v=0.6.0-performance';
+import { createStreamDelivery } from '../lib/stream-delivery.js';
+import { createOrderedDelivery } from '../lib/ordered-delivery.js';
 import { copyBackAntigravityAuth, resolveAntigravityHostAuthPath, resolveAntigravityAuthCacheEntryPath } from '../lib/auth-cache.js';
-import { runAgy } from '../lib/process.js?v=0.6.0-completion';
-import { errorText, looksLikePermissionDenial, sessionIdFrom, usageOf, isObj } from '../lib/result.js';
+import { runAgy } from '../lib/process.js?v=0.6.0-performance';
+import { errorText, looksLikePermissionDenial, sessionIdFrom, usageOf, isObj } from '../lib/result.js?v=0.6.0-performance';
 import { usageSince } from '../lib/usage.js';
 import { estimateAgyCost } from '../lib/agy-pricing.js';
 import { taskContext, dependencySummary } from '../lib/task-context.js';
-import { createEfficiencyTracker } from '../lib/efficiency.js';
+import { createEfficiencyTracker } from '../lib/efficiency.js?v=0.6.0-performance';
 import { acquireWorkspaceLease } from '../lib/workspace-lease.js';
-import { discoverAgyModels } from '../lib/models.js';
-import { detectActiveAccount, detectHeadlessKeychainAccount } from '../lib/account.js';
+import { discoverAgyModels, modelsForExecution, invalidateModelValidation } from '../lib/models.js?v=0.6.0-performance';
+import { detectActiveAccount, observeExecutionAccount } from '../lib/account.js?v=0.6.0-performance';
 import { monitorAccount } from '../lib/account-monitor.js';
-import { readObservedStatus } from '../lib/statusline.js';
-import { loadAccountPool, syncKeychainToPool, markAccountQuotaExhausted, parseQuotaResetDuration } from '../lib/account-pool.js';
+import { syncKeychainToPool, markAccountQuotaExhausted, parseQuotaResetDuration } from '../lib/account-pool.js?v=0.6.0-performance';
 
 const safeText=(v,max=5000)=>typeof v==='string'?v.slice(0,max):'';
 const maybeStr=(v)=>typeof v==='string'?v:'';
@@ -217,6 +217,7 @@ export function buildPrompt(ctx, cfg, instr, helpers, skillIndex = '', options =
       'Completion requires evidence for every acceptance criterion. Wait for required background checks to finish and inspect their exit status and relevant output. A successful turn or elapsed time is not task completion. Record done only when no required work remains; otherwise record the actual review, blocker or continuation path in Paperclip.',
       `Task ID: ${safeText(context.taskId ?? context.issueId ?? ctx.runtime?.taskKey ?? '', 128)}`,
     ];
+    if (options.repeatedInvestigation) messages.push('The verified conversation has repeated tool requests with unchanged results. Continue from its recorded findings. Repeat a read or check only to resolve a named missing fact, verify a relevant change, or satisfy a required acceptance check.');
     if (recoveryContext) messages.push(recoveryContext);
     if (bootstrap) messages.push(bootstrap);
     if (options.staticContextChanged) {
@@ -332,6 +333,34 @@ export function sanitizeTelemetry(value, authToken, depth=0) {
  */
 export async function executeWithHelpers(ctx, helpers, { discoverModels = discoverAgyModels, estimateCost = estimateAgyCost } = {}) {
   ctx={...ctx,config:ctx.config ?? ctx.adapterConfig ?? ctx.agent?.adapterConfig ?? {}};
+  const callbackMetrics = {};
+  for (const name of ['onLog', 'onEvent', 'onRuntimeProgress']) {
+    const callback = ctx[name];
+    if (!callback) continue;
+    callbackMetrics[name] = { calls: 0, totalMs: 0, maxMs: 0 };
+    ctx[name] = async (...args) => {
+      const start = performance.now();
+      try { return await callback(...args); }
+      finally {
+        const elapsed = performance.now() - start, metric = callbackMetrics[name];
+        metric.calls++; metric.totalMs += elapsed; metric.maxMs = Math.max(metric.maxMs, elapsed);
+      }
+    };
+  }
+  let streamDelivery = null;
+  const publication = createOrderedDelivery(async item => {
+    if (item.kind==='log') await ctx.onLog(item.stream,item.text);
+    else if (item.kind==='event') await ctx.onEvent?.(item.event);
+    else if (item.kind==='progress') await ctx.onRuntimeProgress?.(item.value);
+  });
+  const deliverProgress = async value => { await streamDelivery?.flush(); if(ctx.onRuntimeProgress)await publication.append({kind:'progress',value}); };
+  const operationDurationsMs = {};
+  const timed = async (name, fn) => {
+    const start = performance.now();
+    try { return await fn(); } finally { operationDurationsMs[name] = (operationDurationsMs[name] || 0) + performance.now() - start; }
+  };
+  let modelValidationCacheHit = false;
+  let confirmModelValidation = null;
   let spawned=false;
   let stagedSkills=null;
   let journal=null;
@@ -358,11 +387,12 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     if(journal) await journal.append(kind,{phase,elapsedMs:Math.round(now-startedAt),...data});
   };
   const emitEvent=async(event)=>{
+    await streamDelivery?.flush();
     const safe=sanitizeTelemetry(event,ctx.authToken);
     await trace('paperclip.event',safe);
-    await ctx.onEvent?.(safe);
+    if(ctx.onEvent)await publication.append({kind:'event',event:safe});
   };
-  const terminal=async(status,details={})=>{if(terminalWritten)return; terminalWritten=true;await trace('run.terminal',{status,...details});};
+  const terminal=async(status,details={})=>{if(terminalWritten)return;await publication.flush();terminalWritten=true;await trace('run.terminal',{status,...details});};
   try {
     journal=await createJournal({runId:ctx.runId,root:ctx.config?.traceDirectory,token:ctx.authToken});
     await trace('run.started',{adapter:'antigravity',runId:ctx.runId,agentId:ctx.agent?.id,taskId:ctx.runtime?.taskKey ?? ctx.context?.taskId ?? ctx.context?.issueId});
@@ -419,12 +449,23 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     }
     // Preflight authorization must run BEFORE potentially slow external CLI discovery.
     // Unit tests inject deterministic discovery without changing production behavior.
+    phase='account_detection'; await trace('phase.started');
+    const {observed, active:activeAccount, validationIdentity} = await timed('accountObservation', () => observeExecutionAccount());
+    const currentAccountEmail=activeAccount?.email||null;
     phase='model_validation'; await trace('phase.started');
     if (cfg.validateSelectedModelOnRun) {
-      const available = await discoverModels({ config: cfg });
-      if (!Array.isArray(available) || !available.some(entry => entry?.id === cfg.model)) {
+      const validation = await timed('modelDiscovery', () => discoverModels === discoverAgyModels
+        ? modelsForExecution({config:cfg}, validationIdentity)
+        : discoverModels({config:cfg}).then(models => ({models,cacheHit:false})));
+      modelValidationCacheHit = validation.cacheHit;
+      confirmModelValidation = validation.confirm;
+      if (!Array.isArray(validation.models) || !validation.models.some(entry => entry?.id === cfg.model)) {
+        invalidateModelValidation();
         throw new Error(`Model ${cfg.model} is no longer available for the AGY account; refresh Paperclip's model list.`);
       }
+    }
+    if(currentAccountEmail) {
+      await timed('accountPoolSync', () => syncKeychainToPool(null,cfg.accountPoolFile||undefined,activeAccount));
     }
     if (cfg.executionMode === 'implementation') {
       const behindMain = await checkBranchFreshness(cwd);
@@ -441,17 +482,6 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     phase='skills_and_instructions'; await trace('phase.started');
     const instructions=await readInstructions(cfg.instructionsFilePath);
     stagedSkills=await stageAssignedSkills(ctx.config);
-    try {
-      const selectedSkills = selectedSkillEntries(ctx.config);
-      await preparePromptBundle({
-        companyId: ctx.agent?.companyId || 'default',
-        skills: selectedSkills,
-        instructionsContents: instructions,
-        env: process.env,
-      });
-    } catch {
-      // Non-blocking prompt bundle cache preparation
-    }
 
     // Ensure graphify knowledge base is accessible inside isolated worktree checkouts
     const worktreeGraphify = path.join(cwd, 'graphify-out');
@@ -477,7 +507,9 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     const promptSignature=sha256Digest(JSON.stringify({
       protocolVersion: 'efficient-task-context-v2',
       template:cfg.promptTemplate || helpers.DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE || '',
-      instructions, skills:stableSkillsIndex, executionMode:cfg.executionMode, investigationBudget:cfg.investigationBudget,
+      instructions, skills:stableSkillsIndex,
+      ...(stagedSkills.contentDigest ? {skillContents:stagedSkills.contentDigest} : {}),
+      executionMode:cfg.executionMode, investigationBudget:cfg.investigationBudget,
     }));
     const contextFingerprint=staticTaskDigest(isObj(ctx.context) ? ctx.context : {});
     const workspaceId=maybeStr(workspace.workspaceId);
@@ -490,17 +522,6 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     if (oldId && typeof previous?.cwd === 'string' && path.isAbsolute(previous.cwd)) {
       previousCwd = await realpath(previous.cwd).catch(() => null);
     }
-    phase='account_detection'; await trace('phase.started');
-    const observed = await readObservedStatus().catch(()=>null);
-    const activeAccount=observed?.email ? {email:observed.email,source:'statusline'} : await detectActiveAccount().catch(()=>null);
-    const currentAccountEmail=activeAccount?.email||null;
-    if(currentAccountEmail) {
-      const file=cfg.accountPoolFile||undefined;
-      await syncKeychainToPool(await loadAccountPool(file),file);
-    }
-    const headlessKeychain=await detectHeadlessKeychainAccount().catch(()=>null);
-    if(observed?.email && headlessKeychain?.email && observed.email!==headlessKeychain.email)
-      throw new Error('AGY terminal account and headless credential account disagree. Reauthenticate and refresh AGY status before executing.');
     const previousAccount=previous?.account||null;
     const accountChanged=Boolean(previousAccount && currentAccountEmail && previousAccount!==currentAccountEmail);
     if(currentAccountEmail) {
@@ -538,6 +559,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       workspaceBranch:workspace.branch,
       compactResume,
       staticContextChanged:previous?.contextFingerprint!==contextFingerprint,
+      repeatedInvestigation:canResume && previous?.repeatHistory?.results?.some(entry=>entry[1]>=2),
     });
     const buildArgs = (modelToUse, resumeConvId) => {
       const a = ['--input-format', 'stream-json', '--output-format', 'stream-json', '--sandbox',
@@ -580,6 +602,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     for(const [k,v] of Object.entries(bindings)) if(v)env[k]=v;
     await ctx.onMeta?.({adapterType:'antigravity_local',command:cfg.command,cwd,
       commandArgs:args,workspaceId,commandNotes:['Prompt sent via stdin; secrets omitted','Paperclip-assigned issue worktree verified','Sandbox enabled; permissions governed by agy user settings']});
+    await publication.flush();
     await ctx.onCancellationReady?.();
     if(ctx.signal?.aborted)throw new Error('Canceled before dispatch');
     ctx.onDispatch?.();
@@ -597,9 +620,14 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       const limited=text.slice(0,Math.max(0,cfg.maxOutputBytes-logChars));
       if(limited.length<text.length)logTruncated=true;
       logChars+=limited.length;
-      if(limited) await ctx.onLog(stream,limited);
+      if(limited) await publication.append({kind:'log',stream,text:limited});
     };
+    streamDelivery = createStreamDelivery({
+      onText: text => log('stdout', `${JSON.stringify({type:'acpx.text_delta',text,channel:'output'})}\n`),
+      onProgress: ctx.onRuntimeProgress ? value => publication.append({kind:'progress',value}) : null,
+    });
     const emitAcpx = async (payload) => {
+      await streamDelivery.flush();
       await log('stdout', `${JSON.stringify(payload)}\n`);
     };
     await emitAcpx({type:'acpx.status',text:`AGY account: ${currentAccountEmail || 'unverified'} · Model: ${cfg.model}`});
@@ -669,7 +697,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       return null;
     };
 
-    const efficiency = createEfficiencyTracker();
+    const efficiency = createEfficiencyTracker(canResume ? previous?.repeatHistory : null);
     let lastAssistantSnippet = '';
     let toolStepCounter = 0;
     const activeToolCalls = new Map();
@@ -694,6 +722,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       onSpawn:async(meta)=>{
         spawned=true;
         stopAccountMonitor=monitorAccount({initialEmail:currentAccountEmail,detect:detectActiveAccount,onChange:async(email,previousEmail)=>{
+          invalidateModelValidation();
           const message=`AGY account: ${email} · Run started as ${currentAccountEmail || 'unverified'}; next run uses the newly observed account.`;
           await emitEvent({eventType:'account.changed_during_run',stream:'system',level:'warn',message,
             payload:{email,previousEmail,runAccount:currentAccountEmail,model:cfg.model}});
@@ -703,7 +732,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
         spawnedAfterMs=Math.round(performance.now()-startedAt);
         await trace('process.spawn',{...meta,preflightMs:spawnedAfterMs});
         await ctx.onSpawn?.(meta);
-        await ctx.onRuntimeProgress?.({
+        await deliverProgress({
           phase: 'adapter_startup',
           message: `Starting Antigravity harness (${cfg.model})...`,
           currentToolName: null,
@@ -725,6 +754,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
         });
       },
       onEvent:async(evt)=>{
+        publication.check();
         if(evt.event==='result' && /quota|RESOURCE_EXHAUSTED/i.test(String(evt.result?.error || '')))
           quotaObservedAt ??= Date.now();
         await trace('cli.event',evt);
@@ -777,7 +807,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
               mode: cfg.executionMode,
             },
           });
-          await ctx.onRuntimeProgress?.({
+          await deliverProgress({
             phase: 'run_activity',
             message: `Antigravity ready (${cfg.executionMode})`,
             currentToolName: null,
@@ -796,13 +826,9 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
               payload: { stepIndex: s.step_index },
             });
           } else if(s.step_type==='agent_response' && typeof s.text_delta==='string' && s.text_delta) {
-            await emitAcpx({
-              type: 'acpx.text_delta',
-              text: s.text_delta,
-              channel: 'output',
-            });
+            await streamDelivery.text(s.text_delta);
             lastAssistantSnippet = (lastAssistantSnippet + s.text_delta).slice(-200).trim();
-            await ctx.onRuntimeProgress?.({
+            streamDelivery.progress({
               phase: 'run_activity',
               message: lastAssistantSnippet.slice(0, 160) || 'Antigravity responding...',
               currentToolName: null,
@@ -832,7 +858,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
                 ? `${p.toolAction}${target ? `: ${target.slice(0, 120)}` : ''}`
                 : (target ? `Running ${toolName}: ${target.slice(0, 120)}` : `Using ${toolName}`);
 
-              await ctx.onRuntimeProgress?.({
+              await deliverProgress({
                 phase: 'run_activity',
                 message: activeDesc.slice(0, 180),
                 currentToolName: toolName.slice(0, 80),
@@ -931,7 +957,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
               }
               const doneMessage = `${summaryLabel} ${isError ? 'failed' : 'completed'}${durLabel}`;
 
-              await ctx.onRuntimeProgress?.({
+              await deliverProgress({
                 phase: 'run_activity',
                 message: doneMessage.slice(0, 180),
                 currentToolName: null,
@@ -1039,6 +1065,8 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     });
 
     providerStopped=true;
+    await streamDelivery.flush();
+    await publication.flush();
     if (workspaceLease) await workspaceLease.assertStopped();
     phase='finalization'; await trace('phase.started');
     const runtimeDurationMs=cliStartedAt===null?null:Math.round(performance.now()-cliStartedAt);
@@ -1049,6 +1077,8 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       phaseDurationsMs:{...phaseDurationsMs},
       eventQueue:proc.queueMetrics??null,
       efficiency:efficiency.snapshot(),
+      callbackMetrics,operationDurationsMs,modelValidationCacheHit,streamDelivery:streamDelivery.snapshot(),journal:journal.snapshot(),
+      publication:publication.snapshot(),
     };
     await trace('process.exit',{code:proc.code,signal:proc.signal,timedOut:proc.timedOut,reason:proc.reason,performance:performancePayload});
     await emitEvent({
@@ -1067,7 +1097,8 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       await markAccountQuotaExhausted(currentAccountEmail,null,parseQuotaResetDuration(detail),'provider_quota',
         cfg.accountPoolFile||undefined,cfg.model).catch(()=>{});
     }
-  const classification = classifyError(proc);
+    const classification = classifyError(proc);
+    if (['provider_auth_error','provider_quota','provider_result_inconsistent'].includes(classification?.errorCode)) invalidateModelValidation();
     const fail=async(message,clearSession=false,extra={})=>{
       const finalId=typeof proc.final?.conversation_id==='string' && /^[\w-]{5,200}$/.test(proc.final.conversation_id) ? proc.final.conversation_id : null;
       const retainedId=finalId || observedConversationId;
@@ -1082,9 +1113,9 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
         model:cfg.model,account:currentAccountEmail,promptSignature,
         contextFingerprint:canResume ? previous.contextFingerprint : contextFingerprint,
         usageScope:'cumulative',resumeRequired:true,
-        usageTotals:retainedUsageTotals,
+        usageTotals:retainedUsageTotals,repeatHistory:efficiency.history(),
       } : null;
-      await ctx.onRuntimeProgress?.({
+      await deliverProgress({
         phase: 'finalize',
         message: `Execution failed: ${message}`.slice(0, 180),
         currentToolName: null,
@@ -1173,6 +1204,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       return await fail(`Antigravity reported ${proc.final.status}; inspect the corresponding CLI run for details`,lost);
     }
     if(!proc.final.response.trim())return await fail('Antigravity reported success with an empty response');
+    confirmModelValidation?.(cfg.model);
     if(cfg.executionMode==='planning' && (await worktreeStatus(cwd)).length) return await fail('Planning run modified the worktree; manual inspection required');
 
     let dirtyCount = 0;
@@ -1201,10 +1233,10 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     // AGY result counters are cumulative for a resumed conversation.
     const usageObj=usageSince(proc.final.usage,canResume?previous?.usageTotals:null,{isResume:canResume});
     const next=id?{conversationId:id,cwd,taskKey,workspaceId,model:cfg.model,account:currentAccountEmail,
-      usageScope:'cumulative',usageTotals:usageObj.usageTotals,
+      usageScope:'cumulative',usageTotals:usageObj.usageTotals,repeatHistory:efficiency.history(),
       promptSignature,contextFingerprint}:null;
     // Keep API-rate estimates distinct from subscription/provider invoices.
-    const pricing = await estimateCost(cfg.model, usageObj.usage);
+    const pricing = await timed('pricing', () => estimateCost(cfg.model, usageObj.usage));
     await emitAcpx({
       type: 'acpx.result',
       summary: safeText(proc.final.response, 300) || proc.final.status,
@@ -1238,7 +1270,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
         status: proc.final.status,
       },
     });
-    await ctx.onRuntimeProgress?.({
+    await deliverProgress({
       phase: 'finalize',
       message: dirtyCount > 0 ? `Execution completed (${dirtyCount} uncommitted file(s))` : 'Execution completed',
       currentToolName: null,
@@ -1286,7 +1318,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
   } catch(err) {
     const message=errorText(err);
     await trace('run.exception',{message,phase,elapsedMs:Math.round(performance.now()-startedAt),phaseDurationsMs}).catch(()=>{});
-    await ctx.onRuntimeProgress?.({phase:'finalize',message:`Execution failed: ${message}`.slice(0,180),currentToolName:null,lastAssistantSnippet:null,lastEventAt:new Date()}).catch(()=>{});
+    await deliverProgress({phase:'finalize',message:`Execution failed: ${message}`.slice(0,180),currentToolName:null,lastAssistantSnippet:null,lastEventAt:new Date()}).catch(()=>{});
     await emitEvent({eventType:'harness.diagnostic',stream:'stderr',level:'error',message:safeText(message,300),payload:{phase,error:message}}).catch(()=>{});
     await terminal('failed',{message,phase}).catch(()=>{});
     return {exitCode:1,signal:null,timedOut:false,errorMessage:errorText(err),
@@ -1304,7 +1336,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       await ctx.onLog('stderr',safe.message+'\n').catch(()=>{});
     };
     if (stagedSkills) await stagedSkills.cleanup().catch(err=>cleanupWarning('Skills',err));
-    if (journal) await journal.close().catch(err=>cleanupWarning('Journal',err));
+    if (streamDelivery) await streamDelivery.close().catch(err=>cleanupWarning('Stream delivery',err));
     const sandboxAuthPath = cfg?.sandboxAuthJsonPath || ctx?.sandboxAuthJsonPath || ctx?.context?.sandboxAuthJsonPath;
     if (sandboxAuthPath) {
       try {
@@ -1329,6 +1361,15 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     if (workspaceLease) {
       try { await workspaceLease.release(!leaseDispatched || providerStopped); }
       catch (err) { await ctx.onLog('stderr', `Workspace lease cleanup requires inspection: ${errorText(err)}\n`).catch(()=>{}); }
+    }
+    if (journal) {
+      await publication.flush().catch(err=>cleanupWarning('Telemetry delivery',err));
+      await trace('run.performance.final',{totalElapsedMs:Math.round(performance.now()-startedAt),
+        finalizationMs:phase==='finalization'?Math.round(performance.now()-lastPhaseAt):null,
+        callbackMetrics,operationDurationsMs,modelValidationCacheHit,
+        streamDelivery:streamDelivery?.snapshot()??null,journal:journal.snapshot(),publication:publication.snapshot()})
+        .catch(err=>cleanupWarning('Final timing',err));
+      await journal.close().catch(err=>cleanupWarning('Journal',err));
     }
   }
 }

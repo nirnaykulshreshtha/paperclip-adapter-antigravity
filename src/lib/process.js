@@ -16,7 +16,7 @@ export async function runAgy({ command, args, cwd, env, prompt, timeoutMs, grace
     const HIGH_WATER = 128;
     const LOW_WATER = 48;
     let queueDepth = 0;
-    const queueMetrics = { enqueued: 0, peakDepth: 0, peakWaitMs: 0, totalWaitMs: 0, handlerErrors: 0, pausedCount: 0 };
+    const queueMetrics = { enqueued: 0, peakDepth: 0, peakWaitMs: 0, totalWaitMs: 0, handlerErrors: 0, pausedCount: 0, handlerTotalMs: 0, handlerMaxMs: 0, drainMs: 0 };
     let streamsPaused = false;
     const pauseStreams = () => {
       if (streamsPaused || queueDepth < HIGH_WATER) return;
@@ -42,12 +42,16 @@ export async function runAgy({ command, args, cwd, env, prompt, timeoutMs, grace
         const waitMs = performance.now() - enqueuedAt;
         queueMetrics.peakWaitMs = Math.max(queueMetrics.peakWaitMs, waitMs);
         queueMetrics.totalWaitMs += waitMs;
+        const handlerStart = performance.now();
         try { await fn(); }
         catch (e) {
           queueMetrics.handlerErrors++;
           spawnError ||= e;
           requestStop('SIGTERM');
         } finally {
+          const handlerMs = performance.now() - handlerStart;
+          queueMetrics.handlerTotalMs += handlerMs;
+          queueMetrics.handlerMaxMs = Math.max(queueMetrics.handlerMaxMs,handlerMs);
           queueDepth--;
           resumeStreams();
         }
@@ -86,7 +90,9 @@ export async function runAgy({ command, args, cwd, env, prompt, timeoutMs, grace
     const abort=()=>{aborted=true;requestStop('SIGTERM');};
     const finish=async(code,sig)=>{
       if(settled) return; settled=true; cleanup();
+      const drainStart = performance.now();
       await pending;
+      queueMetrics.drainMs = performance.now() - drainStart;
       resolve({code,signal:sig,timedOut,inactivityTimedOut,aborted,stderr,final,malformed,stdoutTruncated,reason:spawnError?.message,queueMetrics:{...queueMetrics,avgWaitMs:queueMetrics.enqueued ? queueMetrics.totalWaitMs/queueMetrics.enqueued : 0}});
     };
     try {

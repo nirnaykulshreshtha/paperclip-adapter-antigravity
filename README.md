@@ -1,4 +1,4 @@
-# Antigravity adapter for Paperclip — v0.5.2
+# Antigravity adapter for Paperclip — v0.6.0
 
 A local external adapter using AGY stream-JSON and Paperclip's task, workspace, transcript, credential and configuration interfaces. Requires Node.js 24.11 or newer, matching the pinned Paperclip SDK. On macOS, model discovery also requires Python 3 for the PTY helper.
 
@@ -26,6 +26,26 @@ A **native external Paperclip adapter**, updated from the supplied v0.2.12 archi
 - `agy` installed and authenticated for the **same OS user / HOME** as the Paperclip adapter worker.
 - A dedicated secondary Git worktree, configured according to `workspaceMode`, `repositoryRoot`, and `allowedWorkspaceRoot`.
 - Python 3 is required for `agy models` under a headless macOS PTY.
+
+## Execution performance and repeated work
+
+Explicit **Refresh models** always queries AGY. Execution validation can reuse live evidence for 60 seconds only after checking the current keychain credential digest, account, expiry and executable identity. Unknown credentials always require live discovery. Credential/account changes, executable updates, explicit refreshes and observed auth/quota failures revoke reuse. A successful provider turn renews evidence for its selected model only, so an immediate continuation avoids another model-list process even after a long turn. A model switch queries the live catalog when the reused evidence does not contain that model. Remote catalog changes can take up to 60 seconds to be reflected; Refresh models forces immediate revalidation.
+
+Each run observes account identity once; a cold model lookup verifies the credentials again after discovery to reject account changes during the lookup. Unchanged account observations avoid redundant durable registry rewrites. The CLI continues to own authentication and account selection.
+
+Adjacent response deltas are batched up to 8 KiB or 100 ms and replaceable progress snapshots are coalesced. Tool/session lifecycle boundaries flush pending text. One ordered publication queue delivers logs, events and progress independently of CLI parsing, with backpressure at 64 items or 256 KiB (a single larger record remains intact). Completion waits for delivery, and persistence failures fail the run. Journals buffer up to 64 KiB or 25 ms, preserve every accepted record in order, and flush/sync terminal records. Abrupt process death can lose the small nonterminal buffer; terminal records remain durable.
+
+Verified resumed sessions retain at most 64 request and result digests to identify repeated unchanged investigation across wakes. They never cache tool outputs or skip required checks. Unchanged role/task context stays compact; skill content changes, including references and executable scripts, invalidate prompt reuse. Existing sessions without assigned skills retain their bootstrap signatures; sessions with skills receive one fresh bootstrap on upgrade to establish content verification. The unused persistent prompt-bundle preparation is removed from execution; assigned skills still receive private per-run copies and cleanup.
+
+Inspect timing without printing account identities, prompts or tool output:
+
+```sh
+npm run perf:summary -- /path/to/antigravity-traces
+# Development checkout only; controlled local benchmark with no real AGY turn:
+npm run perf:benchmark
+```
+
+New traces include callback duration, model-discovery time, validation reuse, publication queue, journal batching and final cleanup timing. See the [performance audit](docs/performance-audit.md) for baseline measurements and controlled benchmark results.
 
 ## Upgrade
 

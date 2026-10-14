@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { createHash } from 'node:crypto';
 import { readObservedStatus } from './statusline.js';
 
 const execFileAsync = promisify(execFile);
@@ -92,4 +93,27 @@ export async function detectHeadlessKeychainAccount(runner=execFileAsync,platfor
       {timeout:3000,encoding:'utf8',windowsHide:true});
     return parseKeyringPayload(stdout);
   }catch{return null;}
+}
+
+/** One credential read per execution; the digest stays in memory, never telemetry. */
+export async function observeExecutionAccount(runner=execFileAsync, platform=process.platform) {
+  const observed = await readObservedStatus().catch(() => null);
+  let raw = null;
+  if (process.env.NODE_ENV === 'test' && !process.env.PAPERCLIP_ANTIGRAVITY_LIVE_KEYCHAIN) {
+    raw = process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD || null;
+  } else if (platform === 'darwin') {
+    try {
+      raw = (await runner('security', ['find-generic-password','-s','gemini','-a','antigravity','-w'],
+        {timeout:3000,encoding:'utf8',windowsHide:true})).stdout;
+    } catch { /* Unknown credentials prohibit cache reuse. */ }
+  }
+  const headless = parseKeyringPayload(raw);
+  if (observed?.email && headless?.email && observed.email !== headless.email)
+    throw new Error('AGY terminal account and headless credential account disagree. Reauthenticate and refresh AGY status before executing.');
+  const active = observed?.email ? {email:observed.email,source:'statusline'}
+    : headless?.email ? {...headless,source:'keychain'} : null;
+  return { observed, active, validationIdentity: {
+    email: headless?.email || null, expired: !headless?.expiry || !Number.isFinite(Date.parse(headless.expiry)) || headless.expired,
+    credentialVersion: headless?.email && raw ? createHash('sha256').update(raw.trim()).digest('hex') : null,
+  } };
 }

@@ -1,15 +1,17 @@
 /**
  * Live Antigravity account model discovery.
  *
- * There is exactly ONE source: `agy models`. No curated catalog, cached
- * generated file, account-default placeholder, or fallback model.
+ * Catalogs have exactly ONE source: `agy models`. Explicit refreshes are live.
+ * Execution may briefly reuse credential-scoped validation in memory.
  *
  * macOS `agy models` can be TTY-sensitive. Our local Python PTY helper
  * allocates a controlling terminal for THIS SAME command without requiring
  * the Paperclip process to own a terminal. No fallback model source is used.
  */
 import { execFile, spawn } from 'node:child_process';
-import { access } from 'node:fs/promises';
+import { access, stat, realpath } from 'node:fs/promises';
+import { createModelValidationCache } from './model-validation-cache.js';
+import { observeExecutionAccount } from './account.js?v=0.6.0-performance';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -20,6 +22,9 @@ const ANSI = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
 const MODEL_ID = /^[a-zA-Z][a-zA-Z0-9._-]{1,99}$/;
 const TIMEOUT_MS = 30_000;
 const discoveryFlights = new Map();
+const validationCache = createModelValidationCache();
+let validationScope = null;
+export const invalidateModelValidation = () => { validationCache.clear(); validationScope = null; };
 const MAX_BYTES = 512 * 1024;
 const PTY_HELPER = fileURLToPath(new URL('./pty-models.py', import.meta.url));
 
@@ -85,6 +90,8 @@ export function makeModelCommand(agy, platform = process.platform) {
 /** One invocation per command/platform at a time. Never cache model authorization
  * across invocations: account switches must be reflected by the next lookup. */
 export async function discoverAgyModels(ctx = {}, runner = execAsync, platform = process.platform) {
+  // Explicit catalog requests revoke previously reused authorization.
+  invalidateModelValidation();
   const agy = await resolveAgyCommand(ctx);
   const key = `${platform}\0${agy}`;
   // Injected test runners must remain isolated from production and each other.
@@ -94,6 +101,45 @@ export async function discoverAgyModels(ctx = {}, runner = execAsync, platform =
   discoveryFlights.set(key, flight);
   try { return await flight; }
   finally { if (discoveryFlights.get(key) === flight) discoveryFlights.delete(key); }
+}
+
+/** Reuse only after a fresh credential observation and unchanged executable. */
+export async function modelsForExecution(ctx, { email, credentialVersion, expired } = {}) {
+  const agy = await resolveAgyCommand(ctx);
+  let executable = null;
+  const candidates = path.isAbsolute(agy) ? [agy] : (process.env.PATH || '').split(path.delimiter).filter(Boolean).map(dir => path.join(dir, agy));
+  for (const candidate of candidates) {
+    try {
+      await access(candidate, 1);
+      const file = await realpath(candidate), info = await stat(file);
+      if (!info.isFile()) continue;
+      executable = { file, identity: `${file}:${info.dev}:${info.ino}:${info.size}:${info.mtimeMs}:${info.ctimeMs}` };
+      break;
+    } catch { /* Preserve normal discovery errors if resolution fails. */ }
+  }
+  const key = email && credentialVersion && !expired && executable
+    ? JSON.stringify([process.platform, executable.identity, email.toLowerCase(), credentialVersion]) : null;
+  if (!key || validationScope !== key) { invalidateModelValidation(); validationScope = key; }
+  const load = async () => {
+    const models = await queryModels(executable?.file || agy, execAsync, process.platform);
+    if (key) {
+      const current = (await observeExecutionAccount()).validationIdentity;
+      if (current.email !== email || current.credentialVersion !== credentialVersion || current.expired) {
+        invalidateModelValidation();
+        throw new Error('AGY credentials changed during model discovery; retry with the current account');
+      }
+    }
+    return models;
+  };
+  let result = await validationCache.get(key, load);
+  const selected = configFromContext(ctx).model;
+  if (result.cacheHit && !result.models.some(entry=>entry.id===selected)) {
+    // A successful turn confirms only one model; switching models needs a live list.
+    invalidateModelValidation();
+    validationScope = key;
+    result = await validationCache.get(key,load);
+  }
+  return result;
 }
 
 async function queryModels(agy, runner, platform) {

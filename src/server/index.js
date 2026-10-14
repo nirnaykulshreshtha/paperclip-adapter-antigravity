@@ -1,13 +1,13 @@
 import { type, models, agentConfigurationDoc } from '../index.js';
 // Paperclip reloads this entry point with a query string; version the changed
 // executor too so an already running host does not retain the old ESM module.
-import { execute } from './execute.js?v=0.6.0-completion';
+import { execute } from './execute.js?v=0.6.0-performance';
 import { testEnvironment } from './test.js';
-import { sessionCodec } from '../lib/result.js?v=0.6.0-completion';
-import { configSchema } from '../lib/config.js?v=0.6.0-completion';
-import { discoverAgyModels } from '../lib/models.js';
-import { getQuotaWindows } from '../lib/quota.js?v=0.6.0-completion';
-import { listSkills, syncSkills } from '../lib/skills.js';
+import { sessionCodec } from '../lib/result.js?v=0.6.0-performance';
+import { configSchema } from '../lib/config.js?v=0.6.0-performance';
+import { discoverAgyModels } from '../lib/models.js?v=0.6.0-performance';
+import { getQuotaWindows } from '../lib/quota.js?v=0.6.0-performance';
+import { listSkills, syncSkills } from '../lib/skills.js?v=0.6.0-performance';
 import { resolveAntigravityAuthCacheDir, writeAntigravityAuthCacheEntry, copyBackAntigravityAuth, resolveAntigravityHostAuthPath, decideAntigravityAuthMerge } from '../lib/auth-cache.js';
 import { resolveAntigravityAuthPrecedence } from '../lib/auth-precedence.js';
 import { runDeviceLogin } from './login-runner.js';

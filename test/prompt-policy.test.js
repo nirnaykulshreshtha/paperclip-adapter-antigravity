@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import {mkdir,writeFile} from 'node:fs/promises';
 import {fixture,fakeContext,helpers,testDeps} from './fixtures.js';
-import {executeWithHelpers,buildPrompt} from '../src/server/execute.js';
+import {executeWithHelpers,buildPrompt,sha256Digest} from '../src/server/execute.js';
 import {normalizeConfig} from '../src/lib/config.js';
 import {sessionCodec} from '../src/lib/result.js';
 
@@ -104,4 +104,28 @@ test('Paperclip session codec preserves context and instruction fingerprints',as
   ctx.runtime.sessionParams=restored;
   const second=await run(ctx);
   assert.equal(second.resultJson.promptStats.mode,'compact_resume');
+});
+
+test('changes to assigned skill reference contents invalidate the resumed policy',async t=>{
+ const f=await fixture(t),source=path.join(f.root,'governance');await mkdir(source);
+ await writeFile(path.join(source,'SKILL.md'),'---\ndescription: Stable description\n---\nRead reference.md.');
+ await writeFile(path.join(source,'reference.md'),'Original approved rules');
+ const config={...f.config,paperclipSkillSync:{desiredSkills:['company/governance']},paperclipRuntimeSkills:[{key:'company/governance',runtimeName:'governance',source}]};
+ const {ctx}=fakeContext(config);
+ const first=await run(ctx);ctx.runtime.sessionParams=first.sessionParams;
+ await writeFile(path.join(source,'reference.md'),'Updated approved rules');
+ let meta;ctx.onMeta=async value=>{meta=value;};
+ const second=await run(ctx);
+ assert.equal(second.resultJson.promptStats.mode,'full');
+ assert.notEqual(second.sessionParams.promptSignature,first.sessionParams.promptSignature);
+ assert.equal(meta.commandArgs.includes('--conversation'),false);
+});
+
+test('upgrading repeat tracking preserves an existing bootstrap signature when no skills are assigned',async t=>{
+ const f=await fixture(t),{ctx}=fakeContext(f.config),cfg=normalizeConfig(f.config);
+ const first=await run(ctx);
+ const priorSignature=sha256Digest(JSON.stringify({protocolVersion:'efficient-task-context-v2',
+  template:helpers.DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,instructions:'',skills:'',
+  executionMode:cfg.executionMode,investigationBudget:cfg.investigationBudget}));
+ assert.equal(first.sessionParams.promptSignature,priorSignature);
 });

@@ -13,6 +13,24 @@ test('tracks identical requests and unchanged results without warning on changed
  assert.equal(t.snapshot().unchangedRepeatResults,2);
  assert.equal(JSON.stringify(t.snapshot()).includes('path'),false);
 });
+test('repeat detection survives verified conversation turns without retaining raw requests or outputs',()=>{
+ let tracker=createEfficiencyTracker();
+ tracker.start('1','view_file',{path:'private-file'});tracker.complete('1','private-output',false);
+ tracker=createEfficiencyTracker(tracker.history());
+ tracker.start('1','view_file',{path:'private-file'});assert.equal(tracker.complete('1','private-output',false),false);
+ tracker=createEfficiencyTracker(tracker.history());
+ tracker.start('1','view_file',{path:'private-file'});assert.equal(tracker.complete('1','private-output',false),true);
+ assert.equal(tracker.snapshot().exactRepeatCalls,1);
+ assert.equal(tracker.snapshot().unchangedRepeatResults,1);
+ assert.ok(!JSON.stringify(tracker.history()).includes('private'));
+ assert.equal(createEfficiencyTracker().snapshot().exactRepeatCalls,0);
+});
+test('repeat history stays bounded and rejects untrusted session contents',()=>{
+ const tracker=createEfficiencyTracker({requests:[['raw command',999999999]],results:[['raw output',1]]});
+ for(let i=0;i<200;i++){tracker.start(String(i),'view_file',{path:String(i)});tracker.complete(String(i),'output',false);}
+ assert.equal(tracker.history().requests.length,64);assert.equal(tracker.history().results.length,64);
+ assert.ok(!JSON.stringify(tracker.history()).includes('raw'));
+});
 test('deduplicates repeated lifecycle events and records failed calls',()=>{
  const t=createEfficiencyTracker();t.start('x','run_command',{command:'test'});t.start('x','run_command',{command:'test'});
  t.complete('x','failure',true);t.complete('x','failure',true);

@@ -1,5 +1,6 @@
 import path from 'node:path';
 import os from 'node:os';
+import { createHash } from 'node:crypto';
 import { copyFile, lstat, mkdtemp, mkdir, readFile, readdir, rm, stat, chmod } from 'node:fs/promises';
 
 const MAX_SKILLS = 32;
@@ -94,11 +95,11 @@ async function buildSnapshot(ctx, desiredOverride) {
   };
 }
 
-async function safeCopyTree(source, dest, counts, depth = 0) {
+async function safeCopyTree(source, dest, counts, digest, relative = '', depth = 0) {
   if (depth > 12) throw new Error('Skill directory nesting exceeds safe limit');
   const items = await readdir(source, { withFileTypes: true });
   await mkdir(dest, { recursive: true, mode: 0o700 });
-  for (const item of items) {
+  for (const item of items.sort((a,b)=>a.name.localeCompare(b.name))) {
     const from = path.join(source, item.name);
     const to = path.join(dest, item.name);
     if (++counts.files > MAX_FILES) throw new Error('Skill bundle file count limit exceeded');
@@ -106,7 +107,11 @@ async function safeCopyTree(source, dest, counts, depth = 0) {
     if (item.isSymbolicLink() || (!item.isFile() && !item.isDirectory())) {
       throw new Error(`Unsupported file type in managed skill: ${item.name}`);
     }
-    if (item.isDirectory()) await safeCopyTree(from, to, counts, depth + 1);
+    const identity = path.join(relative, item.name);
+    if (item.isDirectory()) {
+      digest.update(JSON.stringify(['directory',identity])+'\n');
+      await safeCopyTree(from, to, counts, digest, identity, depth + 1);
+    }
     else {
       const file = await lstat(from);
       if (!file.isFile() || file.nlink > 1) throw new Error('Unsafe managed skill file');
@@ -114,6 +119,7 @@ async function safeCopyTree(source, dest, counts, depth = 0) {
       if (counts.bytes > MAX_TOTAL_BYTES) throw new Error('Skill bundle size limit exceeded');
       await copyFile(from, to);
       await chmod(to, file.mode & 0o111 ? 0o700 : 0o600);
+      digest.update(JSON.stringify(['file',identity,Boolean(file.mode & 0o111),createHash('sha256').update(await readFile(to)).digest('hex')])+'\n');
     }
   }
 }
@@ -121,7 +127,7 @@ async function safeCopyTree(source, dest, counts, depth = 0) {
 /** No writes to checkout / global Antigravity skills. Remove the private bundle after the CLI exits. */
 export async function stageAssignedSkills(config) {
   const selected = selectedSkillEntries(config);
-  if (!selected.length) return { root: null, index: '', cleanup: async () => {} };
+  if (!selected.length) return { root: null, index: '', contentDigest: '', cleanup: async () => {} };
   for (const entry of selected) {
     const error = await validateSkill(entry);
     if (error) throw new Error(`Assigned skill ${entry.key} unavailable: ${error}`);
@@ -131,16 +137,18 @@ export async function stageAssignedSkills(config) {
   try {
     await mkdir(skillsDir, { recursive: true, mode: 0o700 });
     const counts = { files: 0, bytes: 0 };
+    const digest = createHash('sha256');
     const lines = [];
     for (const entry of selected) {
       const destination = path.join(skillsDir, entry.runtimeName);
-      await safeCopyTree(entry.source, destination, counts);
+      await safeCopyTree(entry.source, destination, counts, digest, entry.runtimeName);
       const body = await readFile(path.join(destination, 'SKILL.md'), 'utf8');
       const description = body.match(/^description:\s*(.+)$/m)?.[1]?.replace(/[\r\n]/g, ' ').slice(0, 190) || '';
       lines.push(`- ${entry.runtimeName}${description ? ` — ${description}` : ''}: ${path.join(destination, 'SKILL.md')}`);
     }
     return {
       root,
+      contentDigest: digest.digest('hex'),
       index: '## Skills assigned by Paperclip\n' +
         'These reviewed skill packages are staged for this run only. When a task matches a skill, read its SKILL.md at the listed path before taking action. Follow relevant references from that folder. Do not run scripts merely because a skill contains them. Other company skills are not assigned to this agent.\n' + lines.join('\n'),
       cleanup: () => rm(root, { recursive: true, force: true }),

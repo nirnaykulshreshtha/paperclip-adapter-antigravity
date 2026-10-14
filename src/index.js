@@ -19,4 +19,4 @@ export const agentConfigurationDoc = `# Antigravity CLI — Paperclip workspace-
 - Provider thinking text cannot be reconstructed from thinking-token usage alone.
 - Dynamically fetched official Google token rates produce labelled Standard API-equivalent estimates; actual CLI charges remain unverified. Unsupported or ambiguous models and failed pricing refreshes stay unpriced.
 `;
-export { createServerAdapter } from './server/index.js?v=0.6.0-completion';
+export { createServerAdapter } from './server/index.js?v=0.6.0-performance';

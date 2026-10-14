@@ -8,11 +8,13 @@ export function journalPath(runId, root = path.join(os.homedir(), '.paperclip', 
   const id = createHash('sha256').update(String(runId ?? '')).digest('hex').slice(0, 32);
   return path.join(root, `${id}.jsonl`);
 }
-export async function createJournal({runId, root, token, maxBytes = 32 * 1024 * 1024} = {}) {
+export async function createJournal({runId, root, token, maxBytes = 32 * 1024 * 1024, batchBytes = 64 * 1024, flushIntervalMs = 25} = {}) {
   const file = journalPath(runId, root);
   await mkdir(path.dirname(file), {recursive:true, mode:0o700});
   const handle = await open(file, 'a+', 0o600);
-  let size = (await stat(file)).size, seq = 0, chain = Promise.resolve(), truncated = false, closed = false;
+  let size = (await stat(file)).size, seq = 0, truncated = false, closed = false;
+  let buffer = '', bufferedBytes = 0, pending = null, timer = null, failure = null;
+  const metrics = { records: 0, writes: 0, bytes: 0 };
   // A retried run ID may reopen an existing journal. Preserve monotonic
   // sequence IDs instead of restarting at 1 and confusing the history viewer.
   if (size > 0) {
@@ -27,7 +29,7 @@ export async function createJournal({runId, root, token, maxBytes = 32 * 1024 * 
   }
   // Retain space for a failure or completion record even if verbose CLI output
   // exceeds the configured trace cap.
-  const terminalReserve = Math.min(64 * 1024, Math.floor(maxBytes / 8));
+  const terminalReserve = Math.min(64 * 1024, Math.floor(maxBytes / 4));
   const terminalKinds = new Set(['run.terminal', 'run.exception', 'process.exit']);
   const sanitize = (value, depth = 0) => {
     if (depth > 10) return '[DEPTH_LIMIT]';
@@ -46,37 +48,60 @@ export async function createJournal({runId, root, token, maxBytes = 32 * 1024 * 
     }
     return value;
   };
-  const append = (kind, data = {}) => {
-    if (closed) return Promise.reject(new Error('Execution journal is already closed'));
-    const item = {schema:'agy.trace.v1', runId:String(runId ?? ''), sequence:++seq, timestamp:new Date().toISOString(), kind, data:sanitize(data)};
-    chain = chain.catch(() => {}).then(async () => {
-      const terminalEvent = terminalKinds.has(kind);
-      if (truncated && !terminalEvent) return;
-      const line = JSON.stringify(item) + '\n';
-      const bytes = Buffer.byteLength(line);
-      const limit = terminalEvent ? maxBytes : maxBytes - terminalReserve;
-      if (size + bytes > limit) {
-        if (!truncated && !terminalEvent) {
-          truncated = true;
-          const marker = JSON.stringify({schema:'agy.trace.v1',runId:String(runId??''),sequence:++seq,
-            timestamp:new Date().toISOString(),kind:'journal.truncated',
-            data:{reason:'trace size limit; terminal events still reserved'}})+'\n';
-          const markerBytes = Buffer.byteLength(marker);
-          if (size + markerBytes <= maxBytes) { await handle.writeFile(marker); size += markerBytes; }
-        }
-        return;
+  const flush = async () => {
+    clearTimeout(timer); timer = null;
+    if (pending) await pending;
+    if (failure) throw failure;
+    if (pending) return flush();
+    if (!buffer) return;
+    const batch = buffer, bytes = bufferedBytes;
+    buffer = ''; bufferedBytes = 0;
+    pending = handle.writeFile(batch).then(() => { metrics.writes++; metrics.bytes += bytes; })
+      .catch(err => { failure ||= err; }).finally(() => { pending = null; });
+    await pending;
+    if (failure) throw failure;
+  };
+  const queueLine = line => {
+    const bytes = Buffer.byteLength(line);
+    buffer += line; bufferedBytes += bytes; size += bytes; metrics.records++;
+  };
+  const append = async (kind, data = {}) => {
+    if (closed) throw new Error('Execution journal is already closed');
+    if (failure) throw failure;
+    // Serialize before accepting so mutable caller objects cannot change records.
+    const item = {schema:'agy.trace.v1', runId:String(runId ?? ''), sequence:seq+1, timestamp:new Date().toISOString(), kind, data:sanitize(data)};
+    const terminalEvent = terminalKinds.has(kind);
+    if (truncated && !terminalEvent) return;
+    const line = JSON.stringify(item) + '\n';
+    const bytes = Buffer.byteLength(line);
+    const limit = terminalEvent ? maxBytes : maxBytes - terminalReserve;
+    if (size + bytes > limit) {
+      if (!truncated && !terminalEvent) {
+        truncated = true;
+        const marker = JSON.stringify({schema:'agy.trace.v1',runId:String(runId??''),sequence:++seq,
+          timestamp:new Date().toISOString(),kind:'journal.truncated',
+          data:{reason:'trace size limit; terminal events still reserved'}})+'\n';
+        const markerBytes = Buffer.byteLength(marker);
+        if (size + markerBytes <= maxBytes) queueLine(marker);
       }
-      await handle.writeFile(line);
-      size += bytes;
+      await flush();
+      return;
+    }
+    seq++;
+    queueLine(line);
+    if (terminalEvent || bufferedBytes >= batchBytes) {
+      await flush();
       if (terminalEvent) await handle.sync();
-    });
-    return chain;
+    } else if (!timer) {
+      timer = setTimeout(() => { void flush().catch(() => {}); }, flushIntervalMs);
+      timer.unref?.();
+    }
   };
   const close = async () => {
     if (closed) return;
     closed = true;
-    try { await chain; await handle.sync(); }
+    try { await flush(); await handle.sync(); }
     finally { await handle.close(); }
   };
-  return {file, append, close};
+  return {file, append, flush, close, snapshot: () => ({...metrics})};
 }

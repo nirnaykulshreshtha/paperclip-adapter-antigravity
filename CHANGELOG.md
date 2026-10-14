@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased — Execution performance and repeated work
+
+- Reuse brief model-validation evidence only with freshly observed matching credentials and executable identity; explicit catalog refresh remains live. Successful turns confirm only the selected model for immediate continuation.
+- Batch response deltas and audit writes; coalesce replaceable progress; deliver telemetry through a bounded ordered queue independently of CLI parsing. Preserve lifecycle order, terminal durability and callback failure propagation.
+- Reuse each run's account observation and avoid rewriting unchanged account state. Remove unused prompt-cache preparation from execution.
+- Carry bounded repeat digests across verified conversation turns; invalidate prompt reuse when assigned skill contents change.
+- Add callback, operation, queue, batching and cleanup metrics, a timing summary and a controlled local benchmark.
+
 ## 0.6.0 — Completion-driven execution
 
 - Introduce completion-driven execution as the default policy, including for saved legacy timeout values. Explicit bounded execution requires timeoutPolicy=bounded and a positive timeoutSec.
