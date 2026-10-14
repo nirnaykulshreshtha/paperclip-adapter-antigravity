@@ -1,7 +1,7 @@
 {
   "name": "paperclip-adapter-antigravity",
-  "version": "0.5.1",
-  "description": "Native Paperclip Antigravity CLI adapter with live models, observed account/quota sync, session-safe execution, audited transcripts and explicit unpriced billing",
+  "version": "0.5.4",
+  "description": "Native Paperclip Antigravity CLI adapter with live models, observed account/quota sync, session-safe execution, audited transcripts and verified model-rate cost estimates",
   "type": "module",
   "author": "Nirnay Kulshreshtha <nirnaykulshreshtha@gmail.com>",
   "license": "MIT",
@@ -51,7 +51,7 @@
   ],
   "scripts": {
     "test": "node --test test/*.test.js",
-    "check": "node --check src/index.js && node --check src/server/index.js && node --check src/server/execute.js && node --check src/server/test.js && node --check src/server/login-runner.js && node --check src/ui/parse-stdout.js && node --check src/ui/build-config.js && node --check src/lib/account.js && node --check src/lib/account-pool.js && node --check src/lib/statusline.js && node --check src/lib/usage.js && node --check src/lib/quota.js && node --check src/lib/models.js && node --check src/lib/process.js && node --check src/lib/pricing.js && node --check src/lib/journal.js && node --check src/lib/auth-cache.js && node --check src/lib/auth-precedence.js && node --check src/lib/credential-readiness.js && node --check src/lib/probe-diagnostics.js && node --check src/lib/inactivity-monitor.js && node --check src/lib/prompt-bundle-cache.js && node --check src/lib/task-context.js && node --check src/lib/efficiency.js && node --check src/lib/workspace-lease.js && node --check scripts/statusline-snapshot.mjs && node --check scripts/trace-report.mjs",
+    "check": "node --check src/index.js && node --check src/server/index.js && node --check src/server/execute.js && node --check src/server/test.js && node --check src/server/login-runner.js && node --check src/ui/parse-stdout.js && node --check src/ui/build-config.js && node --check src/lib/account.js && node --check src/lib/account-pool.js && node --check src/lib/statusline.js && node --check src/lib/usage.js && node --check src/lib/quota.js && node --check src/lib/models.js && node --check src/lib/process.js && node --check src/lib/pricing.js && node --check src/lib/agy-pricing.js && node --check src/lib/google-rates.js && node --check scripts/backfill-model-costs.mjs && node --check src/lib/journal.js && node --check src/lib/auth-cache.js && node --check src/lib/auth-precedence.js && node --check src/lib/credential-readiness.js && node --check src/lib/probe-diagnostics.js && node --check src/lib/inactivity-monitor.js && node --check src/lib/prompt-bundle-cache.js && node --check src/lib/task-context.js && node --check src/lib/efficiency.js && node --check src/lib/workspace-lease.js && node --check scripts/statusline-snapshot.mjs && node --check scripts/trace-report.mjs",
     "smoke": "node scripts/local-smoke.js",
     "models:check": "node scripts/check-models.js",
     "doctor": "node scripts/doctor.mjs"

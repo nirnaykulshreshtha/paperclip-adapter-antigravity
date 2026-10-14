@@ -11,11 +11,13 @@ import { copyBackAntigravityAuth, resolveAntigravityHostAuthPath, resolveAntigra
 import { runAgy } from '../lib/process.js';
 import { errorText, looksLikePermissionDenial, sessionIdFrom, usageOf, isObj } from '../lib/result.js';
 import { usageSince } from '../lib/usage.js';
+import { estimateAgyCost } from '../lib/agy-pricing.js';
 import { taskContext, dependencySummary } from '../lib/task-context.js';
 import { createEfficiencyTracker } from '../lib/efficiency.js';
 import { acquireWorkspaceLease } from '../lib/workspace-lease.js';
 import { discoverAgyModels } from '../lib/models.js';
 import { detectActiveAccount, detectHeadlessKeychainAccount } from '../lib/account.js';
+import { monitorAccount } from '../lib/account-monitor.js';
 import { readObservedStatus } from '../lib/statusline.js';
 import { loadAccountPool, syncKeychainToPool, markAccountQuotaExhausted, parseQuotaResetDuration } from '../lib/account-pool.js';
 
@@ -324,7 +326,7 @@ export function sanitizeTelemetry(value, authToken, depth=0) {
  * Tests may inject a deterministic discovery function through the third argument;
  * this never modifies Paperclip's exported execute(ctx) entry point.
  */
-export async function executeWithHelpers(ctx, helpers, { discoverModels = discoverAgyModels } = {}) {
+export async function executeWithHelpers(ctx, helpers, { discoverModels = discoverAgyModels, estimateCost = estimateAgyCost } = {}) {
   ctx={...ctx,config:ctx.config ?? ctx.adapterConfig ?? ctx.agent?.adapterConfig ?? {}};
   let spawned=false;
   let stagedSkills=null;
@@ -334,6 +336,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
   let workspaceLease=null;
   let leaseDispatched=false;
   let providerStopped=false;
+  let stopAccountMonitor=null;
   const startedAt=performance.now();
   let cliStartedAt=null;
   let spawnedAfterMs=null;
@@ -504,20 +507,20 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
         message:'Could not observe current AGY account; use /statusline hook in the interactive terminal'});
     }
     if(accountChanged)await emitEvent({eventType:'account.switched',stream:'system',level:'info',
-      message:'AGY account changed; starting a fresh session',
+      message:'AGY account changed; continuing the task conversation with the newly authenticated account',
       payload:{previousAccount,currentAccount:currentAccountEmail}});
     const modelChanged=Boolean(previous?.model && previous.model!==cfg.model);
     const previousAccountNowUnknown=Boolean(previousAccount && !currentAccountEmail);
+    if(previousAccountNowUnknown) throw new Error('Cannot verify the current AGY account; reconnect authentication to continue the stored conversation.');
     // Don't silently preserve an old system policy if the role instructions
     // or assigned skill inventory have changed. Legacy sessions that predate
     // the fingerprints get one full prompt before compact continuation.
     const promptChanged=Boolean(previous?.promptSignature && previous.promptSignature!==promptSignature);
-    const forceFresh=Boolean(ctx.context?.forceFreshSession || accountChanged || modelChanged || previousAccountNowUnknown || promptChanged);
+    const forceFresh=Boolean(ctx.context?.forceFreshSession || modelChanged || promptChanged);
     const canResume = Boolean(!forceFresh && oldId && previousCwd === cwd &&
       (!previous.taskKey || previous.taskKey === taskKey) &&
       (!previous.workspaceId || previous.workspaceId === workspaceId) &&
-      (!previous.model || previous.model===cfg.model) &&
-      (!previous.account || previous.account===currentAccountEmail));
+      (!previous.model || previous.model===cfg.model));
     if (oldId && !canResume && !forceFresh) {
       throw new Error('Stored conversation belongs to another workspace or task; reset the Paperclip session before retrying');
     }
@@ -594,7 +597,9 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     const emitAcpx = async (payload) => {
       await log('stdout', `${JSON.stringify(payload)}\n`);
     };
+    await emitAcpx({type:'acpx.status',text:`AGY account: ${currentAccountEmail || 'unverified'} · Model: ${cfg.model}`});
 
+    let quotaObservedAt=null;
     const classifyError = (p) => {
       const combined = `${p?.stderr || ''}\n${p?.reason || ''}\n${p?.final?.error || ''}`;
       const isAuth = /(?:not\s+logged\s+into|not\s+logged\s+in|login\s+required|run\s+`?agy\s+auth(?:\s+login)?`?\s+first|please\s+authenticate|token\s+source|unauthenticated|unauthorized|invalid\s+credentials|api[_ ]?key\s+(?:required|missing|invalid)|auth(?:entication)?\s+required)/i.test(combined);
@@ -612,10 +617,15 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
         };
       }
       if (isQuota) {
+        const resetMatch = /resets? in\s+(?:\d+\s*(?:hours?|h|minutes?|min|m|seconds?|sec|s)\s*)+/i.exec(combined);
+        const resetAt = resetMatch ? new Date((quotaObservedAt ?? Date.now()) + parseQuotaResetDuration(resetMatch[0]) - 30_000).toISOString() : null;
+        const identity = currentAccountEmail || 'unverified account';
         return {
           errorCode: 'provider_quota',
           errorFamily: 'provider_quota',
-          message: 'Antigravity token limit / quota reached. Verify Google account quota or switch accounts.',
+          message: `Antigravity token limit / quota reached for ${identity} on ${cfg.model}.${resetMatch ? ` Provider ${resetMatch[0].toLowerCase()}.` : ''} Check quota for this account and model in AGY; another terminal may show a different account.`,
+          resultJson: { quota: { account: currentAccountEmail, model: cfg.model, resetAt },
+            ...(resetAt ? {providerQuotaRetryNotBefore:resetAt} : {}) },
           clearSession: true,
         };
       }
@@ -652,6 +662,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     const activeToolCalls = new Map();
 
     let resumeConvId = canResume ? oldId : null;
+    let observedConversationId = resumeConvId;
     const runArgs=buildArgs(cfg.model,resumeConvId);
     let proc = null;
     phase='cli_execution'; await trace('phase.started',{model:cfg.model,promptMode,promptBytes:Buffer.byteLength(prompt)});
@@ -669,6 +680,12 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       signal:ctx.signal,
       onSpawn:async(meta)=>{
         spawned=true;
+        stopAccountMonitor=monitorAccount({initialEmail:currentAccountEmail,detect:detectActiveAccount,onChange:async(email,previousEmail)=>{
+          const message=`AGY account: ${email} · Run started as ${currentAccountEmail || 'unverified'}; next run uses the newly observed account.`;
+          await emitEvent({eventType:'account.changed_during_run',stream:'system',level:'warn',message,
+            payload:{email,previousEmail,runAccount:currentAccountEmail,model:cfg.model}});
+          await emitAcpx({type:'acpx.status',text:message});
+        }});
         if (workspaceLease) await workspaceLease.markSpawn(meta.pid,meta.processGroupId);
         spawnedAfterMs=Math.round(performance.now()-startedAt);
         await trace('process.spawn',{...meta,preflightMs:spawnedAfterMs});
@@ -695,6 +712,8 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
         });
       },
       onEvent:async(evt)=>{
+        if(evt.event==='result' && /quota|RESOURCE_EXHAUSTED/i.test(String(evt.result?.error || '')))
+          quotaObservedAt ??= Date.now();
         await trace('cli.event',evt);
         if(evt.event==='init') {
           if (evt.init?.permission_mode==='always-proceed') {
@@ -713,6 +732,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
             }
           }
           const convId = typeof evt.conversation_id === 'string' ? evt.conversation_id : null;
+          if(convId && /^[\w-]{5,200}$/.test(convId)) observedConversationId=convId;
           await emitAcpx({
             type: 'acpx.session',
             agent: 'antigravity',
@@ -1001,7 +1021,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
           }
         }
       },
-      onStderr: async (text) => { await trace('cli.stderr',{text}); if (looksLikePermissionDenial(text)) permissionFailure = true; },
+      onStderr: async (text) => { if(/quota|RESOURCE_EXHAUSTED/i.test(text)) quotaObservedAt ??= Date.now(); await trace('cli.stderr',{text}); if (looksLikePermissionDenial(text)) permissionFailure = true; },
     });
 
     providerStopped=true;
@@ -1027,6 +1047,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       await emitEvent({eventType:'tool.execution.interrupted',stream:'system',level:'warn',message:`${tool.toolName} interrupted by process termination`,payload:{executionId:callId,status:'interrupted',durationMs:Date.now()-tool.startTime}});
     }
     activeToolCalls.clear();
+    if(stopAccountMonitor) {await stopAccountMonitor(); stopAccountMonitor=null;}
     if(classifyError(proc)?.errorCode==='provider_quota' && currentAccountEmail) {
       const detail=`${proc.stderr||''} ${proc.reason||''} ${proc.final?.error||''}`;
       await markAccountQuotaExhausted(currentAccountEmail,null,parseQuotaResetDuration(detail),'provider_quota',
@@ -1034,7 +1055,21 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     }
   const classification = classifyError(proc);
     const fail=async(message,clearSession=false,extra={})=>{
-      const keepSession=extra.errorFamily==='provider_quota' && canResume && previous?.promptSignature===promptSignature && Boolean(previous?.contextFingerprint) && Boolean(currentAccountEmail) && previous.account===currentAccountEmail;
+      const finalId=typeof proc.final?.conversation_id==='string' && /^[\w-]{5,200}$/.test(proc.final.conversation_id) ? proc.final.conversation_id : null;
+      const retainedId=finalId || observedConversationId;
+      const keepSession=Boolean(retainedId && (extra.errorFamily==='provider_quota' || ((accountChanged || previous?.resumeRequired) && extra.errorFamily==='session')));
+      let retainedUsageTotals=canResume ? previous.usageTotals ?? null : null;
+      if(keepSession && proc.final?.usage) {
+        try {retainedUsageTotals=usageSince(proc.final.usage,retainedUsageTotals,{isResume:canResume}).usageTotals;}
+        catch { /* A quota error may report zero counters; retain the last verified baseline. */ }
+      }
+      const retainedSession=keepSession ? {
+        ...(canResume ? previous : {}),conversationId:retainedId,cwd,taskKey,workspaceId,
+        model:cfg.model,account:currentAccountEmail,promptSignature,
+        contextFingerprint:canResume ? previous.contextFingerprint : contextFingerprint,
+        usageScope:'cumulative',resumeRequired:true,
+        usageTotals:retainedUsageTotals,
+      } : null;
       await ctx.onRuntimeProgress?.({
         phase: 'finalize',
         message: `Execution failed: ${message}`.slice(0, 180),
@@ -1062,7 +1097,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       return {exitCode:proc.code===0?1:proc.code??1,signal:proc.signal??null,
       timedOut:proc.timedOut,errorMessage:message,
       clearSession:keepSession ? false : clearSession || Boolean(canResume && (proc.code !== 0 || proc.final?.status !== 'SUCCESS')),
-      ...(keepSession ? {sessionParams:previous,sessionDisplayId:oldId} : {}),
+      ...(keepSession ? {sessionParams:retainedSession,sessionDisplayId:retainedId} : {}),
       provider:'antigravity',biller:'antigravity',billingType:'unknown',model:cfg.model,costStatus:'unpriced',
       ...extra,
       resultJson: {
@@ -1080,6 +1115,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       return await fail(classification.message, classification.clearSession, {
         errorCode: classification.errorCode,
         errorFamily: classification.errorFamily,
+        ...(classification.resultJson ? { resultJson: classification.resultJson } : {}),
       });
     }
     if(proc.reason) {
@@ -1122,9 +1158,6 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       return await fail(`Antigravity reported ${proc.final.status}; inspect the corresponding CLI run for details`,lost);
     }
     if(!proc.final.response.trim())return await fail('Antigravity reported success with an empty response');
-    const afterAccount=await detectActiveAccount().catch(()=>null);
-    if(currentAccountEmail && afterAccount?.email && currentAccountEmail!==afterAccount.email)
-      return await fail('AGY account changed during execution; session must not be reused',true,{errorFamily:'auth'});
     if(cfg.executionMode==='planning' && (await worktreeStatus(cwd)).length) return await fail('Planning run modified the worktree; manual inspection required');
 
     let dirtyCount = 0;
@@ -1155,18 +1188,20 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     const next=id?{conversationId:id,cwd,taskKey,workspaceId,model:cfg.model,account:currentAccountEmail,
       usageScope:'cumulative',usageTotals:usageObj.usageTotals,
       promptSignature,contextFingerprint}:null;
-    // Subscription CLI usage is not an authenticated metered API invoice.
-    const hasReportedCost=false;
+    // Keep API-rate estimates distinct from subscription/provider invoices.
+    const pricing = await estimateCost(cfg.model, usageObj.usage);
     await emitAcpx({
       type: 'acpx.result',
       summary: safeText(proc.final.response, 300) || proc.final.status,
       inputTokens: usageObj.usage?.inputTokens,
       outputTokens: usageObj.usage?.outputTokens,
       cachedTokens: usageObj.usage?.cachedInputTokens,
-      costUsd: undefined,
+      costUsd: pricing.costUsd,
       isError: false,
     });
-    await emitAcpx({type:'acpx.status',text:'Dollar cost unavailable: AGY CLI token totals are not billing records'});
+    await emitAcpx({type:'acpx.status',text:pricing.costStatus === 'estimated'
+      ? `Estimated Standard API-equivalent token cost: $${pricing.costUsdExact} (not a CLI charge)`
+      : `Dollar cost unavailable: ${pricing.reason}`});
     await emitEvent({
       eventType: 'turn.completed',
       stream: 'system',
@@ -1201,11 +1236,15 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       exitCode: 0,
       signal: null,
       timedOut: false,
-      provider: 'antigravity',
+      provider: pricing.provider ?? 'antigravity',
       biller: 'antigravity',
       billingType: 'unknown',
       model: cfg.model,
-      costStatus: 'unpriced',
+      costStatus: pricing.costStatus,
+      costUsd: pricing.costUsd,
+      costUsdExact: pricing.costUsdExact,
+      pricingContext: pricing.pricingContext,
+      pricingProvenance: pricing.pricingProvenance,
       usage:usageObj.usage||undefined,
       usageBasis:usageObj.usage?'per_run':null,
       sessionParams:next,
@@ -1217,6 +1256,8 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
         response: safeText(proc.final.response, 20000),
         conversation_id: id,
         account: currentAccountEmail,
+        pricingEstimate: pricing.estimate ?? null,
+        pricingUnavailableReason: pricing.reason ?? null,
         efficiency: efficiency.snapshot(),
         promptStats:{mode:promptMode,bytes:Buffer.byteLength(prompt)},
         worktree: {
@@ -1240,6 +1281,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       },
     };
   } finally {
+    if(stopAccountMonitor) await stopAccountMonitor();
     const cleanupWarning=async (name,err)=>{
       const safe=sanitizeTelemetry({message:`${name} cleanup requires inspection: ${errorText(err)}`},ctx.authToken);
       await ctx.onLog('stderr',safe.message+'\n').catch(()=>{});

@@ -1,4 +1,4 @@
-# Antigravity adapter for Paperclip — v0.5.0
+# Antigravity adapter for Paperclip — v0.5.2
 
 A local external adapter using AGY stream-JSON and Paperclip's task, workspace, transcript, credential and configuration interfaces. Requires Node.js 24.11 or newer, matching the pinned Paperclip SDK. On macOS, model discovery also requires Python 3 for the PTY helper.
 
@@ -14,10 +14,10 @@ A **native external Paperclip adapter**, updated from the supplied v0.2.12 archi
 | Model selection | Paperclip native `listModels` and `refreshModels` run **`agy models`**; model field uses a combobox, not a static catalog; selected ID is verified at run start by default |
 | Credentials | No keychain writes or automatic account switching. Explicit sandbox credential copy-back accepts only a strictly newer credential for the same subscription identity; registry snapshots contain no tokens |
 | Quota | Native `getQuotaWindows` uses the *fresh* interactive AGY quota snapshot, if available; otherwise reports unavailable |
-| Sessions | Resumption tied to task, canonical workspace, workspace ID, account and model; force fresh after detected account/model change |
+| Sessions | Resumption tied to task, canonical workspace, workspace ID and model; account switches continue the stored conversation |
 | Logs | Native Paperclip ACPX transcript (responses, tool calls/results, usage/checkpoints, real thinking deltas if emitted). Structured audit events go to Paperclip's `onEvent` |
 | Usage | Persist cumulative CLI counters and report **per-run delta** on resumed turns. Unknown baselines remain unknown |
-| Cost | No fraudulent Gemini/Claude dollar number from CLI subscription tokens; `costStatus: 'unpriced'`. `src/lib/pricing.js` remains available for independently metered provider responses |
+| Cost | Models matched to Google's official pricing table use dynamically fetched Standard text rates with `costStatus: 'estimated'`, exact decimals and provenance. This is an API-equivalent estimate, not a subscription invoice. Other models or incomplete/expired evidence stay unpriced; see [pricing audit](docs/PRICING_AUDIT.md) |
 | Reliability | Serialized implementation writers, durable provider ownership receipts, private state files, bounded streams, redaction, command/workspace guards |
 
 ## Requirements
@@ -49,7 +49,9 @@ The observer stores only email, model ID, time and quota fields. It never writes
 
 ### Account switching
 
-Use AGY's own login/logout controls in the terminal. The next observed status update, Paperclip model refresh or run picks up the account change. Paperclip starts a new conversation when it detects a different account. **The adapter will not rotate OAuth credentials or replay work after a 429.** This prevents unintended double tool execution and hidden account mismatches.
+Use AGY's own login/logout controls in the terminal. The next observed status update, Paperclip model refresh or run picks up the account change. Paperclip resumes the same stored conversation after an account switch within the same task and workspace. Quota failures retain the conversation ID and cumulative usage baseline, including on the first turn. **The adapter never rotates OAuth credentials itself or replays a failed turn inside the same invocation.** The host recovery monitor admits a continuation once it observes a different account or the provider reset deadline arrives. If AGY refuses a cross-account conversation, the adapter reports the refusal and retains the session instead of silently starting over.
+
+Running tasks publish their starting account and model in the transcript. While a CLI process is running, the adapter checks the observed account every ten seconds and publishes changes, preserving the original run account separately. Switching the terminal account does not prove that an already-running provider session has switched. Quota failures identify the run account, selected model and provider reset duration; structured results also include the reset timestamp when supplied by AGY. The Paperclip task chat account indicator requires the corresponding host UI update.
 
 AGY's terminal observer is not a guaranteed authentication proof. On macOS the adapter additionally checks the currently discoverable keychain identity when available and fails if it conflicts with the observed AGY identity.
 

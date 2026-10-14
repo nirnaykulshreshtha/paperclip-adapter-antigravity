@@ -92,7 +92,7 @@ test('model removed from live agy model list fails before spawn',async t=>{
  assert.equal(spawned.length,0);
 });
 
-test('changing an authenticated account starts a new session instead of reusing previous conversation',async t=>{
+test('changing an authenticated account continues the same task conversation',async t=>{
  const f=await fixture(t);
  process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD=makeMockToken('first@example.com');
  const {ctx}=fakeContext(f.config);
@@ -107,7 +107,8 @@ test('changing an authenticated account starts a new session instead of reusing 
  assert.equal(second.exitCode,0,JSON.stringify(second));
  assert.equal(second.sessionParams.account,'second@example.com');
  assert.ok(events.some(e=>e.eventType==='account.switched'));
- assert.equal(metas[0].commandArgs.includes('--conversation'),false);
+ assert.equal(metas[0].commandArgs.includes('--conversation'),true);
+ assert.equal(metas[0].commandArgs[metas[0].commandArgs.indexOf('--conversation')+1],first.sessionParams.conversationId);
 });
 
 test('model change on the same task starts a fresh model-specific session',async t=>{
@@ -139,7 +140,7 @@ test('telemetry redacts run token and secret-key-shaped arguments',()=>{
  assert.doesNotMatch(JSON.stringify(safe),/token-123|key-123|"pw"/);
 });
 
-test('quota preserves only a verified same-account continuation without replaying it',async t=>{
+test('quota preserves the workspace-bound continuation without replaying it',async t=>{
  const f=await fixture(t);const {ctx,spawned}=fakeContext(f.config);
  process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD=makeMockToken('same@example.com');
  const first=await executeWithHelpers(ctx,helpers,testDeps);
@@ -147,11 +148,12 @@ test('quota preserves only a verified same-account continuation without replayin
  ctx.runtime.sessionParams=first.sessionParams;ctx.context.taskTitle='SCENARIO_QUOTA';
  const quota=await executeWithHelpers(ctx,helpers,testDeps);
  assert.equal(quota.errorCode,'provider_quota');assert.equal(quota.clearSession,false);
- assert.deepEqual(quota.sessionParams,first.sessionParams);
+ assert.deepEqual(quota.sessionParams,{...first.sessionParams,resumeRequired:true});
  assert.equal(spawned.length,2,'only the two requested turns run; no automatic retry');
  ctx.runtime.sessionParams={...first.sessionParams,promptSignature:null};
  const legacy=await executeWithHelpers(ctx,helpers,testDeps);
- assert.equal(legacy.clearSession,true,'unverifiable sessions still clear');
+ assert.equal(legacy.clearSession,false,'workspace-bound legacy conversations retain progress');
+ assert.equal(legacy.sessionParams.conversationId,first.sessionParams.conversationId);
 });
 test('execution accepts host adapterConfig fallback and rejects invalid inactivity settings',async t=>{
  const f=await fixture(t);const {ctx}=fakeContext(f.config);delete ctx.config;

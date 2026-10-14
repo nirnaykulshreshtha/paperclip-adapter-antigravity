@@ -30,8 +30,9 @@ test('successful response records real session and usage; hides token from logs'
  assert.equal(r.sessionParams.conversationId,'abcde-123');
  assert.equal(r.usage.inputTokens,123);
  assert.equal(r.usageBasis,'per_run');
- assert.equal(r.costStatus,'unpriced');
- assert.equal(r.costUsd,undefined);
+ assert.equal(r.costStatus,'estimated');
+ assert.equal(r.costUsdExact,'0.0001095');
+ assert.equal(r.pricingProvenance.source,'rate_card');
  assert.equal(r.billingType,'unknown');
  assert.equal(r.biller,'antigravity');
  assert.ok(logs.some(x=>x[1].includes('done')));
@@ -76,6 +77,63 @@ test('quota / token limit failure classifies provider_quota and clears session',
  assert.equal(r.resultJson?.errorFamily,'provider_quota');
  assert.equal(r.clearSession,true);
  assert.match(r.errorMessage,/token limit \/ quota reached/i);
+});
+test('quota diagnostics identify the execution account, model and compound provider reset', async(t)=>{
+ const f=await fixture(t);
+ process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD=makeMockToken('changed@example.com');
+ const {ctx}=fakeContext(f.config,'SCENARIO_QUOTA_RESET');
+ const before=Date.now();
+ const r=await executeWithHelpers(ctx, helpers, testDeps);
+ assert.equal(r.errorCode,'provider_quota');
+ assert.match(r.errorMessage,/changed@example.com on gemini-3.8-flash-low/);
+ assert.match(r.errorMessage,/resets in 104h52m34s/);
+ assert.equal(r.resultJson.quota.account,'changed@example.com');
+ assert.equal(r.resultJson.quota.model,f.config.model);
+ const resetMs=(104*3600+52*60+34)*1000;
+ assert.ok(Date.parse(r.resultJson.quota.resetAt)>=before+resetMs);
+ assert.ok(Date.parse(r.resultJson.quota.resetAt)<=Date.now()+resetMs);
+ assert.equal(r.resultJson.providerQuotaRetryNotBefore,r.resultJson.quota.resetAt);
+});
+test('quota interruption on the first turn retains progress and resumes the same conversation after an account switch',async t=>{
+ const f=await fixture(t);
+ process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD=makeMockToken('x@example.com');
+ const {ctx,spawned}=fakeContext(f.config,'SCENARIO_QUOTA_PROGRESS');
+ const metas=[];
+ ctx.onMeta=async meta=>metas.push(meta);
+ const failed=await executeWithHelpers(ctx,helpers,testDeps);
+ assert.equal(failed.errorCode,'provider_quota');
+ assert.equal(failed.clearSession,false);
+ assert.equal(failed.sessionParams.conversationId,'quota-progress-123');
+ assert.equal(failed.sessionParams.account,'x@example.com');
+ assert.equal(failed.sessionParams.usageTotals.input_tokens,100);
+ ctx.runtime.sessionParams=sessionCodec.deserialize(sessionCodec.serialize(failed.sessionParams));
+ process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD=makeMockToken('y@example.com');
+ const resumed=await executeWithHelpers(ctx,helpers,testDeps);
+ assert.equal(resumed.exitCode,0,JSON.stringify(resumed));
+ assert.equal(resumed.sessionParams.conversationId,'quota-progress-123');
+ assert.equal(resumed.sessionParams.account,'y@example.com');
+ assert.equal(resumed.usage.inputTokens,23);
+ assert.equal(spawned.length,2);
+ const args=metas[1].commandArgs;
+ assert.equal(args[args.indexOf('--conversation')+1],'quota-progress-123');
+});
+test('a provider refusal to resume after account handoff never silently discards the conversation',async t=>{
+ const f=await fixture(t);
+ f.config.promptPolicy='full_every_turn';
+ process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD=makeMockToken('x@example.com');
+ const {ctx}=fakeContext(f.config,'SCENARIO_QUOTA_PROGRESS');
+ const first=await executeWithHelpers(ctx,helpers,testDeps);
+ ctx.runtime.sessionParams=sessionCodec.deserialize(sessionCodec.serialize(first.sessionParams));
+ assert.equal(ctx.runtime.sessionParams.resumeRequired,true);
+ process.env.PAPERCLIP_TEST_KEYCHAIN_PAYLOAD=makeMockToken('y@example.com');
+ ctx.context.taskTitle='SCENARIO_FAIL_RESUME';
+ for(let attempt=0;attempt<2;attempt++) {
+   const failed=await executeWithHelpers(ctx,helpers,testDeps);
+   assert.equal(failed.errorCode,'session_lost');
+   assert.equal(failed.clearSession,false);
+   assert.equal(failed.sessionParams.conversationId,'quota-progress-123');
+   ctx.runtime.sessionParams=sessionCodec.deserialize(sessionCodec.serialize(failed.sessionParams));
+ }
 });
 test('auth failure classifies provider_auth_error and clears session', async(t)=>{
  const f=await fixture(t);
@@ -126,7 +184,9 @@ test('planning fails before CLI spawn on dirty tree',async(t)=>{
 test('cancels child process and returns failure',async(t)=>{
  const f=await fixture(t);const {ctx}=fakeContext(f.config,'SCENARIO_HANG');
  const ac=new AbortController();ctx.signal=ac.signal;
- setTimeout(()=>ac.abort(),350);
+ // This tests cancellation of a running child, not a race with workspace setup.
+ const onSpawn=ctx.onSpawn;
+ ctx.onSpawn=async meta=>{await onSpawn(meta);setTimeout(()=>ac.abort(),100);};
  const r=await executeWithHelpers(ctx, helpers, testDeps);
  assert.notEqual(r.exitCode,0);
  assert.match(r.errorMessage,/canceled/i);

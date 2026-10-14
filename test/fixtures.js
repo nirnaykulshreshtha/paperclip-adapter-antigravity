@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs';
+import { createGoogleRateClient } from '../src/lib/google-rates.js';
+import { estimateAgyCost } from '../src/lib/agy-pricing.js';
 import {mkdtemp, writeFile, chmod, rm} from 'node:fs/promises';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
@@ -57,6 +60,13 @@ process.stdin.on('end',()=>{
  if(scenario==='MALFORMED'){console.log('{not JSON}');process.exit(0);}
  if(scenario==='NO_RESULT'){console.log(JSON.stringify({event:'init',conversation_id:'abcde-123'}));process.exit(0);}
  if(scenario==='QUOTA'){console.error('RESOURCE_EXHAUSTED: quota exceeded 429');process.exit(3);}
+ if(scenario==='QUOTA_RESET'){console.error('Individual quota reached. Resets in 104h52m34s.');process.exit(3);}
+ if(scenario==='QUOTA_PROGRESS' && !process.argv.includes('--conversation')){
+   console.log(JSON.stringify({event:'init',conversation_id:'quota-progress-123',init:{permission_mode:'request-review'}}));
+   console.log(JSON.stringify({event:'step_update',step_update:{step_type:'tool',state:'DONE',step_index:1,tool_name:'read_file',tool_info:{output:'checkpoint reached'}}}));
+   console.log(JSON.stringify({event:'result',result:{status:'ERROR',conversation_id:'quota-progress-123',response:'',error:'Individual quota reached. Resets in 2h3m4s.',usage:{input_tokens:100,output_tokens:10}}}));
+   process.exit(3);
+ }
  if(scenario==='QUOTA_ONCE'){
    const fs = require('fs');
    const path = require('path');
@@ -75,11 +85,12 @@ process.stdin.on('end',()=>{
  if(scenario==='WRITE'){
    require('fs').writeFileSync('unexpected.txt','unauthorized');
  }
- console.log(JSON.stringify({event:'init',conversation_id:'abcde-123',init:{permission_mode:scenario==='AUTO_APPROVE'?'always-proceed':'request-review'}}));
+ const conversationId=process.argv.includes('--conversation')?process.argv[process.argv.indexOf('--conversation')+1]:'abcde-123';
+ console.log(JSON.stringify({event:'init',conversation_id:conversationId,init:{permission_mode:scenario==='AUTO_APPROVE'?'always-proceed':'request-review'}}));
  console.log(JSON.stringify({event:'step_update',step_update:{step_type:'agent_response',state:'DONE',text_delta:'done'}}));
  if(scenario==='SOFT_DENY')console.error('Tool permission denied by policy');
  const status=scenario==='ERROR'?'ERROR':'SUCCESS';
- console.log(JSON.stringify({event:'result',result:{status,conversation_id:'abcde-123',response:status==='SUCCESS'?'done':'',error:status==='ERROR'?'mock failure':undefined,usage:{input_tokens:123,output_tokens:4,cache_read_tokens:30}}}));
+ console.log(JSON.stringify({event:'result',result:{status,conversation_id:conversationId,response:status==='SUCCESS'?'done':'',error:status==='ERROR'?'mock failure':undefined,usage:{input_tokens:123,output_tokens:conversationId==='quota-progress-123'?14:4,cache_read_tokens:30}}}));
 });
 `);
   await chmod(exe,0o755);
@@ -101,6 +112,8 @@ export const helpers={
 };
 
 /** Deterministic model discovery for unit tests. Not wired to exported execute(ctx). */
+const fixtureRateClient=createGoogleRateClient({fetchImpl:async()=>({ok:true,text:async()=>readFileSync(new URL('./google-pricing-fixture.html',import.meta.url),'utf8')}),now:()=>Date.parse('2026-10-14T06:12:05Z')});
 export const testDeps = {
+  estimateCost: (model, usage) => estimateAgyCost(model,usage,{at:new Date('2026-10-14T06:12:05Z'),rateClient:fixtureRateClient}),
   discoverModels: async () => [{ id: 'gemini-3.8-flash-low', label: 'Fixture model' }],
 };

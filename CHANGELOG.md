@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.5.4 — Verified account recovery release
+
+- Package account handoff, quota continuation and verified model-rate pricing changes with refreshed runtime import versions.
+- Verified live BUC-25 recovery under the newly authenticated account using its retained AGY conversation ID.
+
+## 0.5.3 — Account handoff and quota continuation
+
+- Preserve CLI conversation IDs and usage baselines on quota interruptions, including the first turn; resume the same task under a newly authenticated account.
+- Retain interrupted sessions when a provider refuses account handoff, without silently creating a new conversation.
+- Publish account changes during runs and expose current credential identity independently of quota-window availability.
+- Supply exact provider reset timestamps to Paperclip recovery; host changes bring quota waits forward after account switches and synchronize second-level countdowns with server time.
+
+## 0.5.2 — Verified Gemini token-rate estimates
+
+- Connect exact-decimal pricing to successful run accounting for explicitly mapped Gemini 3.8 Flash variants using dynamically fetched official Google Standard rates.
+- Emit `estimated`, exact USD, rate provenance and a calculation snapshot; retain unpriced fallback for unsupported models, incomplete per-run counters and ambiguous or unavailable official pricing.
+- Replay actual BUC-15 counters in regression tests; price cached reads separately and preserve resumed-run delta semantics.
+
 ## 0.5.1 — Supported implementation CLI mode
 
 - Omit the implementation mode override: AGY supports `accept-edits`, `auto` and `plan`, not `default`. Preserve sandbox and implementation authorization.
