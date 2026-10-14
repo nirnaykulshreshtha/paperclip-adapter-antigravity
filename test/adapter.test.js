@@ -32,7 +32,7 @@ test('successful response records real session and usage; hides token from logs'
  assert.equal(r.usageBasis,'per_run');
  assert.equal(r.costStatus,'unpriced');
  assert.equal(r.costUsd,undefined);
- assert.equal(r.billingType,'external_cli_unverified');
+ assert.equal(r.billingType,'unknown');
  assert.equal(r.biller,'antigravity');
  assert.ok(logs.some(x=>x[1].includes('done')));
  assert.ok(logs.some(x=>x[1].includes('"acpx.text_delta"')));
@@ -130,6 +130,8 @@ test('cancels child process and returns failure',async(t)=>{
  const r=await executeWithHelpers(ctx, helpers, testDeps);
  assert.notEqual(r.exitCode,0);
  assert.match(r.errorMessage,/canceled/i);
+ assert.equal(r.billingType,'unknown');
+ assert.equal(r.costStatus,'unpriced');
 });
 test('codec discards invalid sessions and preserves taskKey',()=>{
  assert.equal(sessionCodec.deserialize({conversationId:'!!'}),null);

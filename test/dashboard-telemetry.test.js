@@ -164,6 +164,7 @@ process.stdin.on('end', () => {
       model: 'gemini-3.8-flash-high',
       validateSelectedModelOnRun: false,
       timeoutSec: 30,
+      traceDirectory: path.join(f.root, 'traces'),
     },
     context: { taskId: 'task-telem', taskTitle: 'Telemetry test' },
     authToken: 'token-secret-123',
@@ -174,7 +175,9 @@ process.stdin.on('end', () => {
   };
 
   const res = await executeWithHelpers(ctx, helpers, testDeps);
-  assert.equal(res.exitCode, 0);
+  assert.equal(res.exitCode, 0, JSON.stringify(res));
+  assert.ok(res.resultJson.efficiency.toolCalls > 0);
+  assert.equal(res.resultJson.efficiency.toolCalls, events.filter(e => e.eventType === 'tool.execution.started').length);
 
   // 1. Verify onRuntimeProgress captures stages and currentToolName
   assert.ok(runtimeProgress.length >= 5, `Expected at least 5 progress updates, got ${runtimeProgress.length}`);

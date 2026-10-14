@@ -15,6 +15,8 @@ These patches **do not** guarantee that the CLI actually reduces metered input t
 
 ## Team protocol (must be configured in Paperclip; adapter cannot enforce it)
 
+**Feature workspace.** Children of one feature umbrella should explicitly reuse one designated, registered secondary Git worktree and integration branch. Set `executionWorkspaceId` to that workspace and `executionWorkspacePreference: reuse_existing` with `executionWorkspaceSettings.mode: reuse_existing` on the children. A parent relationship alone does not guarantee workspace sharing. Keep the project default isolated so unrelated features remain separate. Preserve and reconcile existing child commits before rebinding; stop active writers first. Use the parent issue for shared decisions, interface contracts and accepted commit handoffs, while keeping conversations task-scoped. Serialize writers or explicitly assign disjoint file scopes. The adapter validates the supplied checkout but cannot schedule writers or enforce umbrella membership.
+
 **Task assignment.** The Delivery Lead assigns one implementation owner to each issue and defines acceptance criteria, writable file scope, dependencies and expected test commands. A review or QA agent may read the issue and repo but must not independently implement the same change without an explicit transfer.
 
 **Before implementation.** The owner checks issue status, latest handoff, existing branch/commits and current tests. If requirements are already met, they verify and report rather than implementing the feature a second time.
@@ -61,3 +63,11 @@ Compare the same task classes under `compact_resume` and `full_every_turn`. Don'
 ## Rollback
 
 Stop the plugin, restore the original adapter folder and restart/reload the external adapter. As a lower-risk first response to a compact-resume problem, set `promptPolicy: full_every_turn` in agent configuration. Keep your original package and account state backups. Do not loosen implementation approvals or sandbox settings.
+
+## Recovery and billing compatibility
+
+A shutdown-interrupted run must be reconciled through Paperclip's recovery action API using observed action outcomes before a successor is queued. Recovery prompts explicitly preserve completed work and use the current assigned workspace. Agent-level wakes without a task ID remain idle and tell the user to run from the issue; they do not implement in a fallback agent home.
+
+CLI runs emit the host-supported `billingType: unknown` with `costStatus: unpriced`. The former adapter-specific `external_cli_unverified` value is not accepted by Paperclip cost receipts. Persisted historical receipts need the host accounting compatibility mapping before retrying through the accounting API; do not invent a dollar cost or subscription classification.
+
+For Paperclip-assigned linked worktrees, the adapter adds the verified Git common directory to AGY's workspace so Git can access objects and worktree indexes outside cwd, without adding the primary source checkout. Paperclip dev watch must exclude registered adapter local paths (including canonical symlink targets); reload adapter updates only after active runs stop.

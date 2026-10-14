@@ -90,4 +90,6 @@ test('disabling allowUnattendedRuntime fails closed with structured permission_d
   assert.equal(result.errorCode, 'permission_denied');
   assert.equal(result.resultJson?.errorFamily, 'permission');
   assert.match(result.errorMessage, /permission policy is unsafe/i);
+  assert.match(result.errorMessage, /allowUnattendedRuntime=false/);
+  assert.match(result.errorMessage, /Enable Allow unattended runtime/);
 });

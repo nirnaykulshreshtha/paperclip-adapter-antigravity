@@ -71,5 +71,5 @@ export async function resolveAssignedWorkspace(ctx, cfg) {
   if (cfg.executionMode === 'implementation' && !workspaceId) {
     throw new Error('Implementation needs a Paperclip execution workspace ID');
   }
-  return { cwd, root: allowedRoot, branch, workspaceId, taskKey, projectId: str(supplied.projectId), source: str(supplied.source), strategy: str(supplied.strategy) };
+  return { cwd, root: allowedRoot, branch, workspaceId, taskKey, gitCommonDir: assignedCommon, projectId: str(supplied.projectId), source: str(supplied.source), strategy: str(supplied.strategy) };
 }

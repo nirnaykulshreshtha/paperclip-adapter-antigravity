@@ -29,11 +29,18 @@ test('Paperclip dynamic checkout overrides configured cwd and selects validated 
  const resolved=await resolveAssignedWorkspace(ctx,normalizeConfig(config));
  assert.equal(resolved.cwd,await realpath(f.secondary));
  assert.equal(resolved.workspaceId,'ws-123');
+ assert.equal(resolved.gitCommonDir,await realpath(path.join(f.primary,'.git')));
+ let args;
+ ctx.onMeta=async meta=>{args=meta.commandArgs;};
  const result=await executeWithHelpers(ctx, helpers, testDeps);
  assert.equal(result.exitCode,0,JSON.stringify(result));
  assert.equal(result.sessionParams.workspaceId,'ws-123');
  assert.equal(result.sessionParams.cwd,await realpath(f.secondary));
  assert.equal(spawned.length,1);
+ const gitArg=args.indexOf('--add-dir');
+ assert.ok(gitArg>=0);
+ assert.equal(args[gitArg+1],resolved.gitCommonDir);
+ assert.ok(!args.includes(f.primary));
 });
 
 test('canonicalizes symlinked worktree paths and safely resumes the same issue',async t=>{
@@ -190,6 +197,8 @@ test('unassigned heartbeat wake in Paperclip mode returns clean idle status with
  assert.equal(result.exitCode,0,JSON.stringify(result));
  assert.equal(result.resultJson.status,'SUCCESS');
  assert.match(result.summary,/heartbeat completed/i);
+ assert.match(result.resultJson.response,/Start Run now from the issue/);
+ assert.equal(result.billingType,'unknown');
  assert.equal(spawned.length,0);
 });
 

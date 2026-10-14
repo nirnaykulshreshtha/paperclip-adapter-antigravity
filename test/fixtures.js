@@ -4,7 +4,7 @@ import {promisify} from 'node:util';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 process.env.NODE_ENV = 'test';
-export const FIXTURE_SUITE_VERSION = '0.4.1';
+export const FIXTURE_SUITE_VERSION = '0.4.2';
 const exec=promisify(execFile);
 
 export function makeMockToken(email) {
@@ -83,7 +83,7 @@ process.stdin.on('end',()=>{
 });
 `);
   await chmod(exe,0o755);
-  const config={command:exe,cwd:secondary,allowedWorkspaceRoot:secondary,executionMode:'planning',model:'gemini-3.8-flash-low',timeoutSec:30,accountPoolFile:mockPoolFile,validateSelectedModelOnRun:true};
+  const config={command:exe,cwd:secondary,allowedWorkspaceRoot:secondary,executionMode:'planning',model:'gemini-3.8-flash-low',timeoutSec:30,accountPoolFile:mockPoolFile,validateSelectedModelOnRun:true,traceDirectory:path.join(root,'traces')};
   return {root,primary,secondary,exe,config,mockPoolFile};
 }
 export function fakeContext(config, taskTitle='SCENARIO_OK') {

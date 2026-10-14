@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import {mkdir,writeFile} from 'node:fs/promises';
 import {fixture,fakeContext,helpers,testDeps} from './fixtures.js';
-import {executeWithHelpers} from '../src/server/execute.js';
+import {executeWithHelpers,buildPrompt} from '../src/server/execute.js';
 import {normalizeConfig} from '../src/lib/config.js';
 import {sessionCodec} from '../src/lib/result.js';
 
@@ -12,6 +12,24 @@ async function run(ctx) {
   assert.equal(result.exitCode,0,JSON.stringify(result));
   return result;
 }
+
+test('reconciled recovery refreshes continuation guidance in full and compact prompts', async t=>{
+  const f=await fixture(t);const {ctx}=fakeContext(f.config);
+  ctx.context.previousRunId='interrupted-run';
+  ctx.context.recoveryActionId='recovery-action';
+  for (const compactResume of [false,true]) {
+    const prompt=buildPrompt(ctx,normalizeConfig(f.config),'',helpers,'',{compactResume});
+    assert.match(prompt,/Previous run: interrupted-run/);
+    assert.match(prompt,/Recovery action: recovery-action/);
+    assert.match(prompt,/verify outcomes before repeating writes/);
+    assert.match(prompt,/do not reuse paths from the interrupted conversation/);
+  }
+  delete ctx.context.previousRunId;
+  ctx.context.retryOfRunId='fallback-run';
+  assert.match(buildPrompt(ctx,normalizeConfig(f.config),'',helpers),/Previous run: fallback-run/);
+  delete ctx.context.retryOfRunId;
+  assert.doesNotMatch(buildPrompt(ctx,normalizeConfig(f.config),'',helpers),/Reconciled execution continuation/);
+});
 
 test('resumed AGY session does not resend unchanged long instructions and parent task',async t=>{
   const f=await fixture(t);

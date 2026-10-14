@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.3 — Shared feature execution and efficiency fixes
+
+- Deliver nested Paperclip assignments and detect requirement changes on resumed conversations.
+- Provide verified workspace context, focused-test guidance, and a configurable cooperative investigation budget.
+- Report exact tool repeats and unchanged results in run efficiency diagnostics.
+- Guide shared feature worktree handoffs and reconciled recovery; expose missing-task wakes clearly.
+- Use the supported `unknown` billing type while preserving unpriced CLI usage, and grant verified Git metadata access for Paperclip-linked worktrees.
+- Add regression tests and the OTP efficiency audit. Subscription quota savings remain unmeasured; no hard token cap is claimed.
+
+## 0.4.2 — Actionable runtime permission diagnostics
+
+- Explain how to resolve the conflict between AGY's `always-proceed` runtime and `allowUnattendedRuntime=false`, while retaining permission-denied classification and authorization checks.
+- Keep test fixture journals in temporary directories instead of the operator's Paperclip trace directory.
+
 ## 0.4.1 — Runtime Permission Policy Authorization & Structured Error Classification
 
 - **Unattended Stream-JSON Authorization**: Real headless `agy` processes emit `init.permission_mode === 'always-proceed'`. Authorized unattended execution across planning mode (`executionMode === 'planning'`), issue-scoped worktrees (`cfg.approvedIssueIds`), and verified legacy fixed workspaces.

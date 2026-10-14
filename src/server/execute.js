@@ -11,6 +11,8 @@ import { copyBackAntigravityAuth, resolveAntigravityHostAuthPath, resolveAntigra
 import { runAgy } from '../lib/process.js';
 import { errorText, looksLikePermissionDenial, sessionIdFrom, usageOf, isObj } from '../lib/result.js';
 import { usageSince } from '../lib/usage.js';
+import { taskContext, dependencySummary } from '../lib/task-context.js';
+import { createEfficiencyTracker } from '../lib/efficiency.js';
 import { discoverAgyModels } from '../lib/models.js';
 import { detectActiveAccount, detectHeadlessKeychainAccount } from '../lib/account.js';
 import { readObservedStatus } from '../lib/statusline.js';
@@ -181,6 +183,7 @@ export function formatToolProgress(s) {
 
 /** Stable task fingerprint, excluding volatile wake comments and per-run identifiers. */
 export function staticTaskDigest(context = {}) {
+  context = taskContext(context);
   const fields = [
     'taskId', 'issueId', 'identifier', 'taskIdentifier', 'taskTitle',
     'taskDescription', 'description', 'priority', 'parentId',
@@ -192,7 +195,14 @@ export function staticTaskDigest(context = {}) {
 
 /** Build a bounded prompt without duplicating arbitrary private server context. */
 export function buildPrompt(ctx, cfg, instr, helpers, skillIndex = '', options = {}) {
-  const context = isObj(ctx.context)?ctx.context:{};
+  const context = taskContext(ctx.context);
+  const bootstrap = options.workspaceCwd
+    ? `## Verified execution context\nAssigned checkout: ${safeText(options.workspaceCwd, 4096)}\nBranch: ${safeText(options.workspaceBranch, 256)}\nThe assignment below is already supplied by Paperclip. Start with the relevant code and acceptance gaps. Do not rediscover identity using env, ps or repeated GETs. Use PAPERCLIP_API_URL and the host-issued PAPERCLIP_API_KEY for task updates; never print the environment or credentials. Fetch issue comments only for a missing handoff or new steering.`
+    : '';
+  const recoveryRunId = maybeStr(context.previousRunId) || maybeStr(context.retryOfRunId);
+  const recoveryContext = recoveryRunId
+    ? `## Reconciled execution continuation\nPrevious run: ${safeText(recoveryRunId, 128)}\nRecovery action: ${safeText(context.recoveryActionId ?? '', 128)}\nContinue the remaining assigned task in the current Paperclip workspace. Read the recorded recovery evidence and previous run handoff, then inspect current commits and file changes before acting. A stopped run is not proof that every action failed: verify outcomes before repeating writes, migrations, sends or external actions. Preserve completed work. If the workspace changed, use the current assigned checkout and its shared feature contracts; do not reuse paths from the interrupted conversation. Report completion only after checking the issue acceptance criteria.`
+    : '';
   if (options.compactResume) {
     // AGY --conversation must already have been verified against task, account,
     // model and canonical workspace. Previously delivered instructions remain
@@ -202,6 +212,8 @@ export function buildPrompt(ctx, cfg, instr, helpers, skillIndex = '', options =
       'Resume the existing conversation and its approved instructions. Do not restart completed investigation or repeat already reported work. Check current worktree state and the latest task changes before acting. Keep permission, review and release gates unchanged.',
       `Task ID: ${safeText(context.taskId ?? context.issueId ?? ctx.runtime?.taskKey ?? '', 128)}`,
     ];
+    if (recoveryContext) messages.push(recoveryContext);
+    if (bootstrap) messages.push(bootstrap);
     if (options.staticContextChanged) {
       for (const [label, value] of [
         ['Task title', context.taskTitle],
@@ -209,7 +221,7 @@ export function buildPrompt(ctx, cfg, instr, helpers, skillIndex = '', options =
         ['Parent epic / issue ID', context.parentId ?? context.parentIssueId],
         ['Parent epic title', context.parentTitle ?? context.parentIssueTitle],
         ['Parent epic description', context.parentDescription],
-        ['Upstream blockers / dependencies', Array.isArray(context.dependencies) ? context.dependencies.join(', ') : context.dependencies],
+        ['Upstream blockers / dependencies', dependencySummary(context.dependencies)],
       ]) {
         if (typeof value === 'string' && value) messages.push(`${label}: ${safeText(value, 20000)}`);
       }
@@ -237,6 +249,8 @@ export function buildPrompt(ctx, cfg, instr, helpers, skillIndex = '', options =
   };
   const main = cfg.promptTemplate || helpers.DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE || 'You are agent {{agent.id}} ({{agent.name}}).';
   const sections=[helpers.renderTemplate(main,templateData)];
+  if (recoveryContext) sections.push(recoveryContext);
+  if (bootstrap) sections.push(bootstrap);
   if(instr) sections.push('## Paperclip-managed agent instructions\n'+instr);
   if(skillIndex) sections.push(skillIndex);
 
@@ -248,7 +262,7 @@ export function buildPrompt(ctx, cfg, instr, helpers, skillIndex = '', options =
     ['Parent epic / issue ID', context.parentId??context.parentIssueId],
     ['Parent epic title', context.parentTitle??context.parentIssueTitle],
     ['Parent epic description', context.parentDescription],
-    ['Upstream blockers / dependencies', Array.isArray(context.dependencies) ? context.dependencies.join(', ') : context.dependencies],
+    ['Upstream blockers / dependencies', dependencySummary(context.dependencies)],
     ['Task description', context.taskDescription??context.description],
     ['Wake reason', context.wakeReason],
     ['Wake comment', context.wakeCommentBody],
@@ -269,7 +283,14 @@ export function buildPrompt(ctx, cfg, instr, helpers, skillIndex = '', options =
   }
 
   sections.push(`## Cross-Agent Squad Collaboration & Context Sharing\n` +
+    `- Start by checking the assigned acceptance gaps against existing implementation and the upstream handoff. Keep a short record of files already read and verified results; reuse it within this conversation.\n` +
+    `- Read targeted file ranges and batch independent reads. Reread a file or rerun a test only after relevant changes, a failure to diagnose, or a specific missing fact. Do not repeat broad repository discovery on every child task.\n` +
+    `- Run focused tests for the touched scope first. Reserve full feature regression for integration/QA gates or changes that cross those boundaries. Preserve required acceptance checks; report unavailable external evidence as a precise blocker instead of repeatedly researching it.\n` +
+    `- Initial investigation budget: ${cfg.investigationBudget ?? 12} tool calls. Then produce a scoped change, a concrete verification result, or a precise blocker. Further investigation must name the unresolved question; do not restart discovery. This is guidance, not permission to skip required checks.\n` +
     `- Delivery Lead coordinates assignments; Technical Architect owns shared interface contracts; specialists own assigned implementation scopes.\n` +
+    `- Children of one feature umbrella share its designated integration workspace/branch and parent issue as the source of decisions, contracts and handoffs. Read the parent and completed sibling handoffs before starting. Separate task conversations remain task-scoped.\n` +
+    `- Verify that Paperclip assigned the umbrella's execution workspace. If a child has a different checkout, report the mismatch to the Delivery Lead before implementation; do not create another worktree or silently copy changes. Preserve existing commits and reconcile them through a reviewed handoff.\n` +
+    `- A shared checkout requires serialized writers or explicitly disjoint file ownership. Never switch branches, reset, clean, stash or overwrite another owner's in-flight changes. Publish accepted commits and shared contract changes on the parent issue and reference them from the child.\n` +
     `- Before editing, inspect the current issue, assigned owner, dependencies, existing worktree commits and latest handoff; verify existing solutions rather than repeating research.\n` +
     `- One implementation owner per issue/file scope. Do not simultaneously rewrite another agent's files. Ask the Delivery Lead for a cross-domain child task or a scoped ownership transfer.\n` +
     `- For API/schema changes needed by another agent, publish a minimal versioned interface contract in the shared Paperclip issue before implementing consumers.\n` +
@@ -332,7 +353,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
   const terminal=async(status,details={})=>{if(terminalWritten)return; terminalWritten=true;await trace('run.terminal',{status,...details});};
   try {
     journal=await createJournal({runId:ctx.runId,root:ctx.config?.traceDirectory,token:ctx.authToken});
-    await trace('run.started',{adapter:'antigravity'});
+    await trace('run.started',{adapter:'antigravity',runId:ctx.runId,agentId:ctx.agent?.id,taskId:ctx.runtime?.taskKey ?? ctx.context?.taskId ?? ctx.context?.issueId});
     if (typeof ctx.authToken !== 'string' || !ctx.authToken.trim()) {
       throw new Error('Antigravity execution requires a host-issued run-scoped Paperclip API token');
     }
@@ -344,6 +365,8 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     // If Paperclip wakes the agent on a heartbeat or on-demand without an assigned issue/task,
     // handle it cleanly as an idle heartbeat check instead of crashing on worktree resolution.
     if (cfg.workspaceMode === 'paperclip' && !hasAssignedTask) {
+      const idleMessage = 'No task was selected for this agent wake. Start Run now from the issue to use its assigned execution workspace; no implementation was started.';
+      await ctx.onLog('stdout', JSON.stringify({ type: 'acpx.text_delta', text: idleMessage + '\n' }) + '\n');
       await terminal('success',{reason:'idle_heartbeat'});
       return {
         exitCode: 0,
@@ -351,14 +374,14 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
         timedOut: false,
         provider: 'antigravity',
         biller: 'antigravity',
-        billingType: 'external_cli_unverified',
+        billingType: 'unknown',
         model: cfg.model,
         costStatus: 'unpriced',
-        summary: `Agent ${ctx.agent?.name || 'idle'}: heartbeat completed. No active task assigned.`,
+        summary: `Agent ${ctx.agent?.name || 'idle'}: heartbeat completed. ${idleMessage}`,
         resultJson: {
           status: 'SUCCESS',
           conversationContinuation: 'continue_conversation_v1',
-          response: 'Heartbeat idle check completed; no active task assigned.',
+          response: idleMessage,
           conversation_id: null,
         },
       };
@@ -369,7 +392,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       : await validateWorkspace(cfg);
     const {cwd} = workspace;
     if (cfg.workspaceMode === 'paperclip' && cfg.executionMode === 'implementation') {
-      const issueId = maybeStr(ctx.context?.issueId) || maybeStr(ctx.context?.taskId);
+      const issueId = maybeStr(ctx.context?.issueId) || maybeStr(ctx.context?.taskId) || maybeStr(taskContext(ctx.context).taskId);
       if (!issueId || (!cfg.approvedIssueIds.includes(issueId) && !cfg.approvedProjectIds.includes(workspace.projectId))) {
         throw new Error('Implementation blocked: current issue has no explicit issue or isolated project implementation authorization');
       }
@@ -435,8 +458,9 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       ? stagedSkills.index.replaceAll(stagedSkills.root,'[STAGED_SKILL_ROOT]')
       : stagedSkills.index;
     const promptSignature=sha256Digest(JSON.stringify({
+      protocolVersion: 'efficient-task-context-v2',
       template:cfg.promptTemplate || helpers.DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE || '',
-      instructions, skills:stableSkillsIndex, executionMode:cfg.executionMode,
+      instructions, skills:stableSkillsIndex, executionMode:cfg.executionMode, investigationBudget:cfg.investigationBudget,
     }));
     const contextFingerprint=staticTaskDigest(isObj(ctx.context) ? ctx.context : {});
     const workspaceId=maybeStr(workspace.workspaceId);
@@ -493,6 +517,8 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     const promptMode=compactResume?'compact_resume':'full';
     const prompt=buildPrompt(ctx,cfg,instructions,helpers,stagedSkills.index, {
       graphifyAvailable:hasGraphify,
+      workspaceCwd:cwd,
+      workspaceBranch:workspace.branch,
       compactResume,
       staticContextChanged:previous?.contextFingerprint!==contextFingerprint,
     });
@@ -500,6 +526,10 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       const a = ['--input-format', 'stream-json', '--output-format', 'stream-json', '--sandbox',
         `--mode=${cfg.executionMode === 'planning' ? 'plan' : 'default'}`, '--print-timeout', `${cfg.timeoutSec}s`];
       a.push('--model', modelToUse);
+      // Linked worktrees keep Git objects/indexes outside cwd. This path came
+      // from Git and was verified against the explicitly trusted repository;
+      // do not grant access to the primary source checkout or a context hint.
+      if (workspace.gitCommonDir) a.push('--add-dir', workspace.gitCommonDir);
       if (stagedSkills.root) a.push('--add-dir', stagedSkills.root);
       if (cfg.effort) a.push('--effort', cfg.effort);
       if (cfg.cliAgent) a.push('--agent', cfg.cliAgent);
@@ -521,7 +551,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     // The only source of API key is Paperclip's run-scoped, host-issued token.
     if(ctx.authToken)env.PAPERCLIP_API_KEY=ctx.authToken;
     const bindings={
-      PAPERCLIP_TASK_ID:maybeStr(ctx.context?.taskId)||maybeStr(ctx.context?.issueId),
+      PAPERCLIP_TASK_ID:maybeStr(ctx.context?.taskId)||maybeStr(ctx.context?.issueId)||maybeStr(taskContext(ctx.context).taskId),
       PAPERCLIP_WAKE_REASON:maybeStr(ctx.context?.wakeReason),
       PAPERCLIP_WAKE_COMMENT_ID:maybeStr(ctx.context?.wakeCommentId),
       PAPERCLIP_APPROVAL_ID:maybeStr(ctx.context?.approvalId),
@@ -534,6 +564,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     if(ctx.signal?.aborted)throw new Error('Canceled before dispatch');
     ctx.onDispatch?.();
     let permissionFailure=false;
+    let runtimePermissionError=null;
     let logChars=0;
     let logTruncated=false;
     const log = async (stream,text) => {
@@ -603,6 +634,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       return null;
     };
 
+    const efficiency = createEfficiencyTracker();
     let lastAssistantSnippet = '';
     let toolStepCounter = 0;
     const activeToolCalls = new Map();
@@ -652,7 +684,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
         await trace('cli.event',evt);
         if(evt.event==='init') {
           if (evt.init?.permission_mode==='always-proceed') {
-            const issueId = maybeStr(ctx.context?.issueId) || maybeStr(ctx.context?.taskId);
+            const issueId = maybeStr(ctx.context?.issueId) || maybeStr(ctx.context?.taskId) || maybeStr(taskContext(ctx.context).taskId);
             const isAuthorizedImplementation = cfg.executionMode === 'implementation' && (
               cfg.workspaceMode === 'paperclip'
                 ? (cfg.approvedProjectIds.includes(workspace.projectId) || (issueId && cfg.approvedIssueIds.includes(issueId)))
@@ -660,7 +692,11 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
             );
             const isAuthorizedPlanning = cfg.executionMode === 'planning';
             const approvedRuntime = cfg.allowUnattendedRuntime && (isAuthorizedImplementation || isAuthorizedPlanning);
-            if (!approvedRuntime) return false;
+            if (!approvedRuntime) {
+              runtimePermissionError = 'Antigravity runtime permission policy is unsafe: AGY reported always-proceed but allowUnattendedRuntime=false. Enable Allow unattended runtime in the agent adapter configuration to use non-interactive AGY within the verified sandbox and authorized worktree.';
+              await emitEvent({eventType:'harness.diagnostic',stream:'system',level:'error',message:runtimePermissionError,payload:{errorCode:'permission_denied',permissionMode:'always-proceed',allowUnattendedRuntime:cfg.allowUnattendedRuntime}});
+              return false;
+            }
           }
           const convId = typeof evt.conversation_id === 'string' ? evt.conversation_id : null;
           await emitAcpx({
@@ -732,6 +768,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
             const callId = String(s.step_index != null ? `tool-${s.step_index}` : (s.tool_info?.id || `tool-${++toolStepCounter}`));
 
             if(s.state==='ACTIVE') {
+              efficiency.start(callId, toolName, p);
               activeToolCalls.set(callId, {
                 toolName,
                 parameters: p,
@@ -841,6 +878,9 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
 
               const summaryLabel = saved.toolSummary || p.toolSummary || toolName;
               await trace('tool.completed',{executionId:callId,name:toolName,parameters:finalParams,target:finalTarget,startedAt:saved.startedAt??null,completedAt:new Date().toISOString(),durationMs,status:isError?'failed':'completed',output:outputText,outputBytes:Buffer.byteLength(outputText,'utf8'),outputDigest:sha256Digest(outputText),error:isError?errText:null});
+              if (efficiency.complete(callId, outputText, isError)) {
+                await emitEvent({eventType:'harness.efficiency',stream:'system',level:'warn',message:'The same tool request returned unchanged output three times. Verify a concrete change or missing fact before repeating investigation.',payload:efficiency.snapshot()});
+              }
               const doneMessage = `${summaryLabel} ${isError ? 'failed' : 'completed'}${durLabel}`;
 
               await ctx.onRuntimeProgress?.({
@@ -958,6 +998,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       cliDurationMs:runtimeDurationMs,
       phaseDurationsMs:{...phaseDurationsMs},
       eventQueue:proc.queueMetrics??null,
+      efficiency:efficiency.snapshot(),
     };
     await trace('process.exit',{code:proc.code,signal:proc.signal,timedOut:proc.timedOut,reason:proc.reason,performance:performancePayload});
     await emitEvent({
@@ -1004,10 +1045,11 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       return {exitCode:proc.code===0?1:proc.code??1,signal:proc.signal??null,
       timedOut:proc.timedOut,errorMessage:message,
       clearSession:clearSession || Boolean(canResume && (proc.code !== 0 || proc.final?.status !== 'SUCCESS')),
-      provider:'antigravity',biller:'antigravity',billingType:'external_cli_unverified',model:cfg.model,costStatus:'unpriced',
+      provider:'antigravity',biller:'antigravity',billingType:'unknown',model:cfg.model,costStatus:'unpriced',
       ...extra,
       resultJson: {
         conversationContinuation: 'continue_conversation_v1',
+        efficiency: efficiency.snapshot(),
         ...(extra.errorFamily ? { errorFamily: extra.errorFamily } : {}),
         ...(isObj(extra.resultJson) ? extra.resultJson : {}),
       }};
@@ -1025,7 +1067,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
     if(proc.reason) {
       const isPerm = /permission/i.test(proc.reason);
       const isInactivity = /inactivity/i.test(proc.reason);
-      return await fail(`Antigravity execution failed: ${proc.reason}`, false, {
+      return await fail(`Antigravity execution failed: ${runtimePermissionError || proc.reason}`, false, {
         errorCode: isPerm ? 'permission_denied' : (isInactivity ? 'antigravity_output_inactivity_monitor' : 'adapter_failed'),
         errorFamily: isPerm ? 'permission' : (isInactivity ? 'execution' : undefined),
       });
@@ -1143,7 +1185,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
       timedOut: false,
       provider: 'antigravity',
       biller: 'antigravity',
-      billingType: 'external_cli_unverified',
+      billingType: 'unknown',
       model: cfg.model,
       costStatus: 'unpriced',
       usage:usageObj.usage||undefined,
@@ -1157,6 +1199,7 @@ export async function executeWithHelpers(ctx, helpers, { discoverModels = discov
         response: safeText(proc.final.response, 20000),
         conversation_id: id,
         account: currentAccountEmail,
+        efficiency: efficiency.snapshot(),
         promptStats:{mode:promptMode,bytes:Buffer.byteLength(prompt)},
         worktree: {
           branch: workspace.branch,
